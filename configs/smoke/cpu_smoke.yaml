@@ -1,0 +1,29 @@
+schema_version: "1.0"
+campaign_id: "cpu-smoke"
+experiment_id: "simulated-cpu-smoke"
+seed:
+  value: 20260921
+workload:
+  id: "W6"
+  probabilities:
+    W1: 0.2
+    W2: 0.2
+    W3: 0.2
+    W4: 0.2
+    W5: 0.2
+arrival:
+  type: "fixed_interval"
+  interval_ms: 1.0
+load:
+  request_count: 20
+batching:
+  max_batch_size: 1
+  max_wait_ms: 0.0
+backend:
+  type: "simulated"
+  service_latency_ms: 2.0
+  ttft_ms: 1.0
+  inter_token_latency_ms: 0.01
+slo:
+  latency_ms: 50.0
+output_dir: "runs"

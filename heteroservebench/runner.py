@@ -1,0 +1,129 @@
+"""Asynchronous load generator and run orchestration."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+
+from heteroservebench.backend import Backend, create_backend
+from heteroservebench.config import ExperimentConfig
+from heteroservebench.io import (
+    MANIFEST_FILENAME,
+    RAW_RESULTS_FILENAME,
+    TRACE_FILENAME,
+    append_raw_result,
+    create_run_dir,
+    refuse_to_overwrite_raw,
+)
+from heteroservebench.manifest import initial_manifest, manifest_hash, new_run_id, utc_now_iso
+from heteroservebench.results import RequestResult
+from heteroservebench.serialization import write_json
+from heteroservebench.workload import BenchmarkRequest, WorkloadTrace, generate_workload
+
+
+async def _execute_one(
+    backend: Backend,
+    request: BenchmarkRequest,
+    base_time_ns: int,
+    raw_path: Path,
+    slo_latency_ms: float | None,
+) -> RequestResult:
+    target_ns = base_time_ns + int(request.scheduled_arrival_time_s * 1_000_000_000)
+    delay_s = max(0.0, (target_ns - time.monotonic_ns()) / 1_000_000_000)
+    if delay_s:
+        await asyncio.sleep(delay_s)
+    dispatch_ns = time.monotonic_ns()
+    try:
+        result = await backend.infer(request)
+    except Exception as exc:
+        result = RequestResult(
+            request_id=request.request_id,
+            workload_id=request.workload_id,
+            scheduled_arrival_time_s=request.scheduled_arrival_time_s,
+            actual_dispatch_time_ns=dispatch_ns,
+            completion_time_ns=time.monotonic_ns(),
+            success=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            input_tokens=request.input_tokens,
+            requested_output_tokens=request.requested_output_tokens,
+            failure_classification="backend_error",
+            backend_metadata=backend.metadata(),
+        )
+    else:
+        result.actual_dispatch_time_ns = dispatch_ns
+
+    if result.backend_start_time_ns is not None and result.actual_dispatch_time_ns is not None:
+        result.queue_latency_s = (result.backend_start_time_ns - result.actual_dispatch_time_ns) / 1_000_000_000
+    if result.completion_time_ns is not None and result.actual_dispatch_time_ns is not None:
+        result.end_to_end_latency_s = (result.completion_time_ns - result.actual_dispatch_time_ns) / 1_000_000_000
+    if result.completion_time_ns is not None and result.backend_start_time_ns is not None:
+        result.service_latency_s = (result.completion_time_ns - result.backend_start_time_ns) / 1_000_000_000
+    if slo_latency_ms is not None:
+        result.slo_latency_ms = slo_latency_ms
+        result.slo_met = (
+            result.success
+            and result.end_to_end_latency_s is not None
+            and result.end_to_end_latency_s * 1000.0 <= slo_latency_ms
+        )
+    append_raw_result(raw_path, result)
+    return result
+
+
+async def replay_schedule(
+    trace: WorkloadTrace,
+    backend: Backend,
+    raw_path: Path,
+    slo_latency_ms: float | None,
+) -> list[RequestResult]:
+    """Replay a planned request schedule against a backend."""
+    refuse_to_overwrite_raw(raw_path)
+    base_time_ns = time.monotonic_ns()
+    tasks = [
+        asyncio.create_task(_execute_one(backend, request, base_time_ns, raw_path, slo_latency_ms))
+        for request in trace.requests
+    ]
+    return await asyncio.gather(*tasks)
+
+
+def run_experiment(config: ExperimentConfig) -> Path:
+    """Execute an experiment and return its run directory."""
+    trace = generate_workload(config)
+    run_id = new_run_id(config.campaign_id)
+    run_dir = create_run_dir(config.output_dir, run_id)
+    raw_path = run_dir / RAW_RESULTS_FILENAME
+    manifest_path = run_dir / MANIFEST_FILENAME
+    manifest = initial_manifest(config, trace, run_id, run_dir)
+    write_json(run_dir / TRACE_FILENAME, trace.canonical())
+    write_json(manifest_path, manifest)
+    backend = create_backend(config.backend)
+
+    try:
+        results = asyncio.run(
+            replay_schedule(
+                trace=trace,
+                backend=backend,
+                raw_path=raw_path,
+                slo_latency_ms=None if config.slo is None else config.slo.latency_ms,
+            )
+        )
+    except BaseException as exc:
+        manifest["run_status"] = "failed"
+        manifest["terminal_error"] = {"type": type(exc).__name__, "message": str(exc)}
+        manifest["end_time"] = utc_now_iso()
+        if raw_path.exists():
+            lines = [line for line in raw_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            manifest["completed_requests"] = len(lines)
+            manifest["failed_requests"] = None
+        manifest["manifest_hash"] = manifest_hash(manifest)
+        write_json(manifest_path, manifest)
+        raise
+
+    manifest["completed_requests"] = sum(1 for result in results if result.success)
+    manifest["failed_requests"] = sum(1 for result in results if not result.success)
+    manifest["run_status"] = "completed" if manifest["failed_requests"] == 0 else "completed_with_failures"
+    manifest["end_time"] = utc_now_iso()
+    manifest["manifest_hash"] = manifest_hash(manifest)
+    write_json(manifest_path, manifest)
+    return run_dir

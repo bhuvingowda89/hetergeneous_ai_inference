@@ -1,0 +1,68 @@
+# HeteroServeBench
+
+HeteroServeBench is research infrastructure for the paper **“HeteroServeBench: Characterizing Heterogeneity Break-Even Regimes for SLO-Constrained LLM Inference.”**
+
+This repository currently implements Phase 2 infrastructure only. It does not implement heterogeneity break-even analysis, GPU scheduling policy comparisons, routing algorithms, or paper conclusions. No benchmark result in this phase should be presented as LLM serving performance evidence.
+
+## What Phase 2 Implements
+
+- Validated, canonical, hashable experiment configuration.
+- Deterministic workload traces for W1-W6 token-length metadata.
+- Fixed-interval and Poisson arrival processes.
+- A backend abstraction with a CPU-safe deterministic simulated backend.
+- A vLLM adapter stub that does not require vLLM installation.
+- Asynchronous schedule replay with per-request raw observations.
+- Immutable raw results separated from derived summaries.
+- Run manifests with provenance and null GPU fields for CPU runs.
+- Structured validation and basic summary metrics.
+
+## What Is Simulated
+
+The `simulated` backend sleeps for a configured service latency and emits request-level timing records. It is only an infrastructure test backend. CPU simulated measurements must never be presented as paper performance results, GPU measurements, or model-serving measurements.
+
+## Setup
+
+Python 3.11+ is recommended; the infrastructure is kept compatible with Python 3.9+ for CPU-only artifact portability.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+## Run The CPU Smoke Benchmark
+
+```bash
+python -m heteroservebench run --config configs/smoke/cpu_smoke.yaml
+```
+
+The command prints the created run directory under `runs/`. Raw request observations are written to `raw_results.jsonl`; manifests and planned traces are separate JSON files.
+
+## Validate A Run
+
+```bash
+python -m heteroservebench validate --run-dir runs/<run_id>
+```
+
+Validation exits nonzero when required provenance, trace, timing, or consistency checks fail.
+
+## Summarize A Run
+
+```bash
+python -m heteroservebench summarize --run-dir runs/<run_id>
+```
+
+Summaries include only basic derived metrics: counts, throughput, latency percentiles, mean latency, and SLO attainment when configured. Analysis code refuses to overwrite existing summary files and never rewrites raw results.
+
+## Repository Organization
+
+- `heteroservebench/config.py` - validated configuration schemas.
+- `heteroservebench/workload.py` - deterministic request trace generation.
+- `heteroservebench/backend.py` - backend interface, simulator, and vLLM stub.
+- `heteroservebench/runner.py` - asynchronous load generation and run orchestration.
+- `heteroservebench/results.py` - raw request observation schema.
+- `heteroservebench/manifest.py` - provenance manifest generation.
+- `heteroservebench/metrics.py` - basic derived summaries.
+- `heteroservebench/validation.py` - structured run validation.
+- `configs/smoke/cpu_smoke.yaml` - small deterministic CPU smoke run.
+- `tests/` - acceptance and regression tests.
