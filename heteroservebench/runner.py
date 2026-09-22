@@ -116,13 +116,14 @@ async def _run_with_optional_telemetry(
     telemetry_path: Path,
     telemetry_enabled: bool,
     telemetry_interval_s: float,
+    selected_cuda_device: str | None,
     slo_latency_ms: float | None,
 ) -> tuple[list[RequestResult], dict]:
     sampler = None
     sampler_task = None
     telemetry_status = {"samples": 0, "complete": None, "errors": []}
     if telemetry_enabled:
-        sampler = TelemetrySampler(telemetry_path, telemetry_interval_s)
+        sampler = TelemetrySampler(telemetry_path, telemetry_interval_s, selected_cuda_device=selected_cuda_device)
         sampler_task = asyncio.create_task(sampler.run())
     try:
         results = await replay_schedule(trace, backend, raw_path, slo_latency_ms)
@@ -160,6 +161,7 @@ async def _execute_run(
         telemetry_path=run_dir / TELEMETRY_FILENAME,
         telemetry_enabled=config.telemetry.enabled,
         telemetry_interval_s=config.telemetry.sampling_interval_s,
+        selected_cuda_device=config.backend.selected_cuda_device if config.backend.type == "vllm" else None,
         slo_latency_ms=None if config.slo is None else config.slo.latency_ms,
     )
     return warmup_results, measured_results, telemetry_status

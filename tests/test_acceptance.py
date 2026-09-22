@@ -20,7 +20,7 @@ from heteroservebench.config import (
     WorkloadConfig,
     load_config,
 )
-from heteroservebench.gpu import parse_nvidia_smi_csv
+from heteroservebench.gpu import benchmark_visible_gpus, parse_nvidia_smi_csv, primary_gpu_profile
 from heteroservebench.io import MANIFEST_FILENAME, RAW_RESULTS_FILENAME, SUMMARY_FILENAME, append_raw_result
 from heteroservebench.manifest import initial_manifest, manifest_hash
 from heteroservebench.metrics import summarize_run
@@ -84,10 +84,25 @@ def make_synthetic_vllm_run(tmp_path: Path, *, gpu_identity: bool = True, ttft_s
     manifest["end_time"] = manifest["start_time"]
     manifest["completed_requests"] = 1
     manifest["failed_requests"] = 0
-    manifest["hardware_profile"]["visible_gpu_count"] = 1
+    manifest["hardware_profile"]["physical_gpu_count"] = 1
+    manifest["hardware_profile"]["benchmark_visible_gpu_count"] = 1
+    manifest["hardware_profile"]["selected_cuda_device"] = "0"
+    manifest["gpu_discovery"] = {
+        "physical_gpu_count": 1,
+        "cuda_visible_devices": "0",
+        "benchmark_visible_gpu_count": 1,
+        "selected_cuda_device": "0",
+        "gpus": [
+            {"index": 0, "name": "Tesla T4", "uuid": "GPU-test", "memory_total_mb": 15109},
+        ],
+        "benchmark_visible_gpus": [
+            {"index": 0, "name": "Tesla T4", "uuid": "GPU-test", "memory_total_mb": 15109},
+        ],
+    }
     if gpu_identity:
         manifest["hardware_profile"]["gpu_name"] = "Tesla T4"
         manifest["hardware_profile"]["gpu_uuid"] = "GPU-test"
+        manifest["hardware_profile"]["gpu_index"] = 0
     else:
         manifest["hardware_profile"]["gpu_name"] = None
         manifest["hardware_profile"]["gpu_uuid"] = None
@@ -387,3 +402,81 @@ def test_t25_existing_cpu_smoke_test_still_passes_without_gpu_dependencies(tmp_p
     config.output_dir = tmp_path
     run_dir = run_experiment(config)
     assert validate_run(run_dir)["valid"]
+
+
+def test_two_physical_gpus_cuda_visible_zero_means_one_benchmark_visible() -> None:
+    gpus = [
+        {"index": 0, "name": "Tesla T4", "uuid": "GPU-0", "memory_total_mb": 15109},
+        {"index": 1, "name": "Tesla T4", "uuid": "GPU-1", "memory_total_mb": 15109},
+    ]
+    visible, error = benchmark_visible_gpus(gpus, "0")
+    assert error is None
+    assert len(visible) == 1
+    assert visible[0]["index"] == 0
+    profile = primary_gpu_profile(
+        {
+            "physical_gpu_count": 2,
+            "cuda_visible_devices": "0",
+            "benchmark_visible_gpu_count": len(visible),
+            "benchmark_visible_gpus": visible,
+            "gpus": gpus,
+        },
+        "0",
+    )
+    assert profile["physical_gpu_count"] == 2
+    assert profile["benchmark_visible_gpu_count"] == 1
+
+
+def test_two_physical_gpus_cuda_visible_zero_one_means_two_benchmark_visible() -> None:
+    gpus = [
+        {"index": 0, "name": "Tesla T4", "uuid": "GPU-0", "memory_total_mb": 15109},
+        {"index": 1, "name": "Tesla T4", "uuid": "GPU-1", "memory_total_mb": 15109},
+    ]
+    visible, error = benchmark_visible_gpus(gpus, "0,1")
+    assert error is None
+    assert [gpu["index"] for gpu in visible] == [0, 1]
+
+
+def test_cuda_visible_unset_defaults_to_discovered_gpu_count() -> None:
+    gpus = [
+        {"index": 0, "name": "Tesla T4", "uuid": "GPU-0", "memory_total_mb": 15109},
+        {"index": 1, "name": "Tesla T4", "uuid": "GPU-1", "memory_total_mb": 15109},
+    ]
+    visible, error = benchmark_visible_gpus(gpus, None)
+    assert error is None
+    assert len(visible) == 2
+
+
+def test_selected_device_absent_validation_failure(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    manifest_path = run_dir / MANIFEST_FILENAME
+    manifest = read_json(manifest_path)
+    manifest["canonical_configuration"]["backend"]["selected_cuda_device"] = "1"
+    manifest["config_hash"] = stable_hash(manifest["canonical_configuration"])
+    manifest["hardware_profile"]["selected_cuda_device"] = "1"
+    write_json(manifest_path, manifest)
+    report = validate_run(run_dir)
+    assert "selected_gpu_absent" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_telemetry_selects_configured_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.telemetry as telemetry
+
+    commands = []
+
+    class Completed:
+        stdout = "1, Tesla T4, GPU-1, 42, 1000, 15109, 70, 50.5\n"
+
+    monkeypatch.setattr(telemetry.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return Completed()
+
+    monkeypatch.setattr(telemetry.subprocess, "run", fake_run)
+    sample = telemetry.sample_gpu_telemetry("1")
+    assert commands[0][1:3] == ["-i", "1"]
+    assert sample["gpu_index"] == 1
+    assert sample["gpu_uuid"] == "GPU-1"
+    assert sample["gpu_name"] == "Tesla T4"

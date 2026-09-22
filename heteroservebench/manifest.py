@@ -67,6 +67,7 @@ def hardware_profile() -> dict[str, Any]:
         "cpu_count": os.cpu_count(),
         "gpu_name": None,
         "gpu_uuid": None,
+        "gpu_index": None,
         "gpu_memory_bytes": None,
         "cuda_version": None,
         "driver_version": None,
@@ -74,7 +75,9 @@ def hardware_profile() -> dict[str, Any]:
         "model_id": None,
         "model_revision_hash": None,
         "container_digest": None,
-        "visible_gpu_count": 0,
+        "physical_gpu_count": 0,
+        "cuda_visible_devices": None,
+        "benchmark_visible_gpu_count": 0,
         "selected_cuda_device": None,
         "gpu_discovery_error": None,
     }
@@ -128,7 +131,7 @@ def initial_manifest(
     gpu_discovery = None
     if config.backend.type == "vllm":
         gpu_discovery = discover_nvidia_gpus()
-        profile.update(primary_gpu_profile(gpu_discovery))
+        profile.update(primary_gpu_profile(gpu_discovery, config.backend.selected_cuda_device))
         profile["model_id"] = config.backend.model
         profile["vllm_version"] = package_metadata().get("vllm")
     return {

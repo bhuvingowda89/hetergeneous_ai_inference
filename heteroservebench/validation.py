@@ -61,6 +61,10 @@ def _valid_timestamp(value: Any) -> bool:
     return True
 
 
+def _gpu_matches_identifier(gpu: dict, identifier: str) -> bool:
+    return str(gpu.get("index")) == identifier or gpu.get("uuid") == identifier
+
+
 def validate_run(run_dir: Path) -> dict:
     """Validate run artifacts and return a structured report."""
     issues: list[dict] = []
@@ -188,17 +192,31 @@ def validate_run(run_dir: Path) -> dict:
 
     if backend_type == "vllm":
         hardware = manifest.get("hardware_profile") or {}
+        discovery = manifest.get("gpu_discovery") or {}
         model = manifest.get("model_provenance") or {}
         config_backend = canonical_config.get("backend", {}) if isinstance(canonical_config, dict) else {}
         if not (hardware.get("gpu_name") or hardware.get("gpu_uuid")):
             issues.append(_issue("missing_gpu_identity", "GPU run does not contain a discovered GPU identity"))
         expected_gpu_count = config_backend.get("expected_gpu_count")
-        if expected_gpu_count is not None and hardware.get("visible_gpu_count") != expected_gpu_count:
+        actual_benchmark_visible = hardware.get("benchmark_visible_gpu_count")
+        if actual_benchmark_visible is None:
+            actual_benchmark_visible = discovery.get("benchmark_visible_gpu_count")
+        if expected_gpu_count is not None and actual_benchmark_visible != expected_gpu_count:
             issues.append(
                 _issue(
                     "gpu_count_mismatch",
-                    "visible GPU count does not match configuration",
-                    context={"expected": expected_gpu_count, "actual": hardware.get("visible_gpu_count")},
+                    "benchmark-visible GPU count does not match configuration",
+                    context={"expected": expected_gpu_count, "actual": actual_benchmark_visible},
+                )
+            )
+        selected_device = config_backend.get("selected_cuda_device") or hardware.get("selected_cuda_device")
+        discovered_gpus = discovery.get("gpus") or []
+        if selected_device is not None and not any(_gpu_matches_identifier(gpu, str(selected_device)) for gpu in discovered_gpus):
+            issues.append(
+                _issue(
+                    "selected_gpu_absent",
+                    "configured selected CUDA device is absent from GPU discovery results",
+                    context={"selected_cuda_device": selected_device},
                 )
             )
         if not model.get("model_id"):

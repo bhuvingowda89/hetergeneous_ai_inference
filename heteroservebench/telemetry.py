@@ -43,11 +43,15 @@ def host_metrics() -> dict:
     }
 
 
-def sample_gpu_telemetry() -> dict:
+def sample_gpu_telemetry(selected_cuda_device: Optional[str] = None) -> dict:
     """Sample one point of GPU telemetry via nvidia-smi."""
     sample = {
         "timestamp_ns": time.time_ns(),
         "timestamp_monotonic_ns": time.monotonic_ns(),
+        "gpu_index": None,
+        "gpu_uuid": None,
+        "gpu_name": None,
+        "selected_cuda_device": selected_cuda_device,
         "gpu_utilization_percent": None,
         "gpu_memory_used_mb": None,
         "gpu_memory_total_mb": None,
@@ -60,12 +64,15 @@ def sample_gpu_telemetry() -> dict:
         sample["telemetry_error"] = "nvidia-smi not found"
         return sample
     try:
+        command = [
+            "nvidia-smi",
+            "--query-gpu=index,name,uuid,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ]
+        if selected_cuda_device is not None:
+            command[1:1] = ["-i", selected_cuda_device]
         completed = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
-                "--format=csv,noheader,nounits",
-            ],
+            command,
             check=True,
             capture_output=True,
             text=True,
@@ -73,11 +80,14 @@ def sample_gpu_telemetry() -> dict:
         )
         first = completed.stdout.splitlines()[0]
         parts = [part.strip() for part in first.split(",")]
-        sample["gpu_utilization_percent"] = float(parts[0])
-        sample["gpu_memory_used_mb"] = float(parts[1])
-        sample["gpu_memory_total_mb"] = float(parts[2])
-        sample["gpu_temperature_c"] = float(parts[3])
-        sample["gpu_power_draw_w"] = float(parts[4])
+        sample["gpu_index"] = int(parts[0])
+        sample["gpu_name"] = parts[1]
+        sample["gpu_uuid"] = parts[2] or None
+        sample["gpu_utilization_percent"] = float(parts[3])
+        sample["gpu_memory_used_mb"] = float(parts[4])
+        sample["gpu_memory_total_mb"] = float(parts[5])
+        sample["gpu_temperature_c"] = float(parts[6])
+        sample["gpu_power_draw_w"] = float(parts[7])
     except Exception as exc:
         sample["telemetry_error"] = f"{type(exc).__name__}: {exc}"
     return sample
@@ -86,9 +96,10 @@ def sample_gpu_telemetry() -> dict:
 class TelemetrySampler:
     """Async best-effort telemetry sampler that never owns request results."""
 
-    def __init__(self, path: Path, interval_s: float) -> None:
+    def __init__(self, path: Path, interval_s: float, selected_cuda_device: Optional[str] = None) -> None:
         self.path = path
         self.interval_s = interval_s
+        self.selected_cuda_device = selected_cuda_device
         self._stop = asyncio.Event()
         self.errors: list[str] = []
         self.samples_written = 0
@@ -97,7 +108,7 @@ class TelemetrySampler:
         """Sample until stopped."""
         while not self._stop.is_set():
             try:
-                sample = await asyncio.to_thread(sample_gpu_telemetry)
+                sample = await asyncio.to_thread(sample_gpu_telemetry, self.selected_cuda_device)
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(sample, sort_keys=True) + "\n")
                 self.samples_written += 1

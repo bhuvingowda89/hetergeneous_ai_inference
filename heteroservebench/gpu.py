@@ -49,6 +49,37 @@ def parse_nvidia_smi_csv(text: str, driver_version: Optional[str] = None, cuda_v
     return gpus
 
 
+def parse_cuda_visible_devices(value: Optional[str]) -> tuple[Optional[list[str]], Optional[str]]:
+    """Parse CUDA_VISIBLE_DEVICES without guessing malformed values."""
+    if value is None:
+        return None, None
+    stripped = value.strip()
+    if stripped == "":
+        return [], None
+    devices = [item.strip() for item in stripped.split(",")]
+    if any(item == "" for item in devices):
+        return None, f"malformed CUDA_VISIBLE_DEVICES: {value!r}"
+    return devices, None
+
+
+def _gpu_matches_identifier(gpu: dict, identifier: str) -> bool:
+    return str(gpu.get("index")) == identifier or gpu.get("uuid") == identifier
+
+
+def benchmark_visible_gpus(gpus: list[dict], cuda_visible_devices: Optional[str]) -> tuple[list[dict], Optional[str]]:
+    """Return GPUs visible to the benchmark after CUDA_VISIBLE_DEVICES scoping."""
+    parsed, error = parse_cuda_visible_devices(cuda_visible_devices)
+    if error:
+        return [], error
+    if parsed is None:
+        return list(gpus), None
+    visible = [gpu for gpu in gpus if any(_gpu_matches_identifier(gpu, item) for item in parsed)]
+    missing = [item for item in parsed if not any(_gpu_matches_identifier(gpu, item) for gpu in gpus)]
+    if missing:
+        return visible, f"CUDA_VISIBLE_DEVICES references undiscovered GPU(s): {','.join(missing)}"
+    return visible, None
+
+
 def _driver_cuda_versions() -> tuple[Optional[str], Optional[str]]:
     if shutil.which("nvidia-smi") is None:
         return None, None
@@ -78,14 +109,17 @@ def _driver_cuda_versions() -> tuple[Optional[str], Optional[str]]:
 
 def discover_nvidia_gpus() -> dict:
     """Discover NVIDIA GPUs with nvidia-smi without requiring CUDA imports."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if shutil.which("nvidia-smi") is None:
         return {
             "available": False,
             "error": "nvidia-smi not found",
-            "visible_gpu_count": 0,
-            "selected_cuda_device": visible,
+            "physical_gpu_count": 0,
+            "cuda_visible_devices": cuda_visible_devices,
+            "benchmark_visible_gpu_count": 0,
+            "selected_cuda_device": None,
             "gpus": [],
+            "benchmark_visible_gpus": [],
         }
     driver, cuda = _driver_cuda_versions()
     try:
@@ -105,35 +139,63 @@ def discover_nvidia_gpus() -> dict:
         return {
             "available": False,
             "error": f"{type(exc).__name__}: {exc}",
-            "visible_gpu_count": 0,
-            "selected_cuda_device": visible,
+            "physical_gpu_count": 0,
+            "cuda_visible_devices": cuda_visible_devices,
+            "benchmark_visible_gpu_count": 0,
+            "selected_cuda_device": None,
             "gpus": [],
+            "benchmark_visible_gpus": [],
             "driver_version": driver,
             "cuda_version": cuda,
         }
+    gpu_dicts = [gpu.__dict__ for gpu in gpus]
+    visible_gpus, visibility_error = benchmark_visible_gpus(gpu_dicts, cuda_visible_devices)
+    parsed_visible, parse_error = parse_cuda_visible_devices(cuda_visible_devices)
+    selected_cuda_device = None
+    if parsed_visible:
+        selected_cuda_device = parsed_visible[0]
     return {
         "available": bool(gpus),
-        "error": None,
-        "visible_gpu_count": len(gpus),
-        "selected_cuda_device": visible,
+        "error": visibility_error or parse_error,
+        "physical_gpu_count": len(gpus),
+        "cuda_visible_devices": cuda_visible_devices,
+        "benchmark_visible_gpu_count": len(visible_gpus) if not visibility_error else None,
+        "selected_cuda_device": selected_cuda_device,
         "driver_version": driver,
         "cuda_version": cuda,
-        "gpus": [gpu.__dict__ for gpu in gpus],
+        "gpus": gpu_dicts,
+        "benchmark_visible_gpus": visible_gpus,
     }
 
 
-def primary_gpu_profile(discovery: dict) -> dict:
-    """Flatten the first discovered GPU into manifest hardware fields."""
+def selected_gpu(discovery: dict, selected_cuda_device: Optional[str] = None) -> Optional[dict]:
+    """Return the selected GPU from discovery, preferring an explicit identifier."""
     gpus = discovery.get("gpus") or []
-    first = gpus[0] if gpus else {}
-    memory_mb = first.get("memory_total_mb")
+    if selected_cuda_device is not None:
+        for gpu in gpus:
+            if _gpu_matches_identifier(gpu, selected_cuda_device):
+                return gpu
+        return None
+    visible = discovery.get("benchmark_visible_gpus") or []
+    if visible:
+        return visible[0]
+    return gpus[0] if gpus else None
+
+
+def primary_gpu_profile(discovery: dict, selected_cuda_device: Optional[str] = None) -> dict:
+    """Flatten the selected benchmark GPU into manifest hardware fields."""
+    chosen = selected_gpu(discovery, selected_cuda_device) or {}
+    memory_mb = chosen.get("memory_total_mb")
     return {
-        "gpu_name": first.get("name"),
-        "gpu_uuid": first.get("uuid"),
+        "gpu_name": chosen.get("name"),
+        "gpu_uuid": chosen.get("uuid"),
+        "gpu_index": chosen.get("index"),
         "gpu_memory_bytes": None if memory_mb is None else memory_mb * 1024 * 1024,
         "cuda_version": discovery.get("cuda_version"),
         "driver_version": discovery.get("driver_version"),
-        "visible_gpu_count": discovery.get("visible_gpu_count", 0),
-        "selected_cuda_device": discovery.get("selected_cuda_device"),
+        "physical_gpu_count": discovery.get("physical_gpu_count", 0),
+        "cuda_visible_devices": discovery.get("cuda_visible_devices"),
+        "benchmark_visible_gpu_count": discovery.get("benchmark_visible_gpu_count", 0),
+        "selected_cuda_device": selected_cuda_device or discovery.get("selected_cuda_device"),
         "gpu_discovery_error": discovery.get("error"),
     }
