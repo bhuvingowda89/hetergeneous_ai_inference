@@ -17,6 +17,7 @@ class RequestResult(BaseModel):
     scheduled_arrival_time_s: float
     actual_dispatch_time_ns: Optional[int] = None
     backend_start_time_ns: Optional[int] = None
+    first_token_time_ns: Optional[int] = None
     completion_time_ns: Optional[int] = None
     success: bool
     error_type: Optional[str] = None
@@ -24,6 +25,7 @@ class RequestResult(BaseModel):
     input_tokens: int = Field(ge=0)
     requested_output_tokens: int = Field(ge=0)
     generated_tokens: Optional[int] = Field(default=None, ge=0)
+    token_event_time_ns: list[int] = Field(default_factory=list)
     ttft_s: Optional[float] = Field(default=None, ge=0)
     inter_token_latency_s: Optional[float] = Field(default=None, ge=0)
     queue_latency_s: Optional[float] = Field(default=None, ge=0)

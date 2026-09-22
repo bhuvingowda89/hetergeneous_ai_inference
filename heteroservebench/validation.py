@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from heteroservebench.config import ExperimentConfig
-from heteroservebench.io import MANIFEST_FILENAME, RAW_RESULTS_FILENAME, TRACE_FILENAME, read_raw_results
+from heteroservebench.io import MANIFEST_FILENAME, RAW_RESULTS_FILENAME, TELEMETRY_FILENAME, TRACE_FILENAME, read_raw_results
 from heteroservebench.results import RequestResult
 from heteroservebench.serialization import read_json, stable_hash
 from heteroservebench.workload import BenchmarkRequest
@@ -39,6 +39,9 @@ REQUIRED_MANIFEST_FIELDS = {
     "completed_requests",
     "failed_requests",
     "raw_result_location",
+    "model_provenance",
+    "telemetry_enabled",
+    "warmup_expected_requests",
 }
 
 
@@ -64,6 +67,7 @@ def validate_run(run_dir: Path) -> dict:
     manifest_path = run_dir / MANIFEST_FILENAME
     trace_path = run_dir / TRACE_FILENAME
     raw_path = run_dir / RAW_RESULTS_FILENAME
+    telemetry_path = run_dir / TELEMETRY_FILENAME
 
     manifest: dict[str, Any] = {}
     try:
@@ -114,6 +118,9 @@ def validate_run(run_dir: Path) -> dict:
     planned_by_id = {request.request_id: request for request in planned}
     planned_ids = [request.request_id for request in planned]
     result_ids = [result.request_id for result in results]
+    backend_type = None
+    if isinstance(canonical_config, dict) and isinstance(canonical_config.get("backend"), dict):
+        backend_type = canonical_config["backend"].get("type")
 
     if len(planned_ids) != len(set(planned_ids)):
         issues.append(_issue("duplicate_planned_request_ids", "planned trace contains duplicate request IDs"))
@@ -129,6 +136,9 @@ def validate_run(run_dir: Path) -> dict:
         issues.append(_issue("more_results_than_planned", "raw results include request IDs absent from the plan", context={"request_ids": extra_result_ids}))
     if len(results) > len(planned):
         issues.append(_issue("more_results_than_planned_count", "raw result count exceeds planned request count"))
+    warmup_in_measured = sorted(request_id for request_id in result_ids if request_id.startswith("warmup-"))
+    if warmup_in_measured:
+        issues.append(_issue("measured_warmup_observations", "warm-up observations are present in measured raw results", context={"request_ids": warmup_in_measured}))
 
     for result in results:
         planned_request = planned_by_id.get(result.request_id)
@@ -152,6 +162,10 @@ def validate_run(run_dir: Path) -> dict:
             and result.completion_time_ns < result.actual_dispatch_time_ns
         ):
             issues.append(_issue("completion_preceding_dispatch", "completion precedes dispatch", context={"request_id": result.request_id}))
+        if result.ttft_s is not None and result.ttft_s < 0:
+            issues.append(_issue("negative_ttft", "TTFT is negative", context={"request_id": result.request_id}))
+        if result.ttft_s is not None and result.end_to_end_latency_s is not None and result.ttft_s > result.end_to_end_latency_s:
+            issues.append(_issue("ttft_exceeds_latency", "TTFT exceeds end-to-end latency", context={"request_id": result.request_id}))
         if result.success:
             missing = [
                 field
@@ -166,6 +180,64 @@ def validate_run(run_dir: Path) -> dict:
                         context={"request_id": result.request_id, "fields": missing},
                     )
                 )
+            if backend_type == "vllm":
+                if result.input_tokens is None or result.requested_output_tokens is None:
+                    issues.append(_issue("success_missing_token_counts", "GPU success record is missing configured token counts", context={"request_id": result.request_id}))
+                if result.generated_tokens is None:
+                    issues.append(_issue("generated_token_count_unavailable", "generated token count was not exposed by backend", severity="warning", context={"request_id": result.request_id}))
+
+    if backend_type == "vllm":
+        hardware = manifest.get("hardware_profile") or {}
+        model = manifest.get("model_provenance") or {}
+        config_backend = canonical_config.get("backend", {}) if isinstance(canonical_config, dict) else {}
+        if not (hardware.get("gpu_name") or hardware.get("gpu_uuid")):
+            issues.append(_issue("missing_gpu_identity", "GPU run does not contain a discovered GPU identity"))
+        expected_gpu_count = config_backend.get("expected_gpu_count")
+        if expected_gpu_count is not None and hardware.get("visible_gpu_count") != expected_gpu_count:
+            issues.append(
+                _issue(
+                    "gpu_count_mismatch",
+                    "visible GPU count does not match configuration",
+                    context={"expected": expected_gpu_count, "actual": hardware.get("visible_gpu_count")},
+                )
+            )
+        if not model.get("model_id"):
+            issues.append(_issue("missing_model_identity", "model provenance is missing model_id"))
+        if not model.get("serving_engine"):
+            issues.append(_issue("missing_serving_engine", "model provenance is missing serving engine"))
+        if model.get("serving_engine_version") is None:
+            issues.append(_issue("missing_serving_engine_version", "serving engine version is unavailable", severity="warning"))
+        if "dtype" not in model or model.get("dtype") in (None, ""):
+            issues.append(_issue("missing_dtype", "model provenance is missing explicit dtype"))
+        if "quantization" not in model:
+            issues.append(_issue("missing_quantization_status", "model provenance is missing explicit quantization status"))
+        if model.get("tensor_parallel_size") is None:
+            issues.append(_issue("missing_tensor_parallel_size", "model provenance is missing tensor parallel size"))
+        if model.get("resolved_model_revision_hash") is None:
+            issues.append(_issue("unidentified_model_revision", "resolved model revision/hash is unavailable", severity="warning"))
+
+        if manifest.get("telemetry_enabled"):
+            telemetry_rows = []
+            if telemetry_path.exists():
+                try:
+                    for line in telemetry_path.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            import json
+
+                            telemetry_rows.append(json.loads(line))
+                except Exception as exc:
+                    issues.append(_issue("corrupt_telemetry", f"cannot read telemetry: {exc}"))
+            if not telemetry_rows:
+                issues.append(_issue("missing_telemetry", "telemetry was enabled but no samples were recorded"))
+            else:
+                starts = [result.actual_dispatch_time_ns for result in results if result.actual_dispatch_time_ns is not None]
+                ends = [result.completion_time_ns for result in results if result.completion_time_ns is not None]
+                sample_times = [row.get("timestamp_monotonic_ns") for row in telemetry_rows if row.get("timestamp_monotonic_ns") is not None]
+                if starts and ends and sample_times:
+                    lower = min(starts)
+                    upper = max(ends)
+                    if not any(lower <= sample <= upper for sample in sample_times):
+                        issues.append(_issue("telemetry_no_overlap", "telemetry timestamps do not overlap measured experiment time"))
 
     report = {
         "valid": not any(issue["severity"] == "error" for issue in issues),

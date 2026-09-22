@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from heteroservebench import __version__
 from heteroservebench.config import ExperimentConfig
+from heteroservebench.gpu import discover_nvidia_gpus, primary_gpu_profile
 from heteroservebench.serialization import stable_hash
 from heteroservebench.workload import WorkloadTrace
 
@@ -47,7 +48,7 @@ def git_commit_sha(cwd: Path) -> str | None:
 
 def package_metadata() -> dict[str, str | None]:
     """Capture versions of runtime packages used by the benchmark."""
-    packages = ["heteroservebench", "pydantic", "yaml"]
+    packages = ["heteroservebench", "pydantic", "yaml", "vllm"]
     values: dict[str, str | None] = {}
     for package in packages:
         lookup = "PyYAML" if package == "yaml" else package
@@ -73,6 +74,45 @@ def hardware_profile() -> dict[str, Any]:
         "model_id": None,
         "model_revision_hash": None,
         "container_digest": None,
+        "visible_gpu_count": 0,
+        "selected_cuda_device": None,
+        "gpu_discovery_error": None,
+    }
+
+
+def model_provenance(config: ExperimentConfig) -> dict[str, Any]:
+    """Return model provenance fields, leaving unknown values null."""
+    if config.backend.type != "vllm":
+        return {
+            "model_id": None,
+            "requested_model_revision": None,
+            "resolved_model_revision_hash": None,
+            "tokenizer_identifier": None,
+            "dtype": None,
+            "quantization": None,
+            "tensor_parallel_size": None,
+            "serving_engine": None,
+            "serving_engine_version": None,
+            "serving_engine_command": None,
+            "max_model_len": None,
+            "warnings": [],
+        }
+    warnings = []
+    if config.backend.requested_model_revision is None:
+        warnings.append("requested model revision is not specified")
+    return {
+        "model_id": config.backend.model,
+        "requested_model_revision": config.backend.requested_model_revision,
+        "resolved_model_revision_hash": None,
+        "tokenizer_identifier": config.backend.tokenizer or config.backend.model,
+        "dtype": config.backend.dtype,
+        "quantization": config.backend.quantization,
+        "tensor_parallel_size": config.backend.tensor_parallel_size,
+        "serving_engine": "vllm",
+        "serving_engine_version": package_metadata().get("vllm"),
+        "serving_engine_command": config.backend.serving_engine_command,
+        "max_model_len": config.backend.max_model_len,
+        "warnings": warnings,
     }
 
 
@@ -84,6 +124,13 @@ def initial_manifest(
 ) -> dict[str, Any]:
     """Create a manifest before request execution starts."""
     canonical_config = config.canonical()
+    profile = hardware_profile()
+    gpu_discovery = None
+    if config.backend.type == "vllm":
+        gpu_discovery = discover_nvidia_gpus()
+        profile.update(primary_gpu_profile(gpu_discovery))
+        profile["model_id"] = config.backend.model
+        profile["vllm_version"] = package_metadata().get("vllm")
     return {
         "schema_version": "1.0",
         "campaign_id": config.campaign_id,
@@ -97,7 +144,9 @@ def initial_manifest(
         "workload": config.workload.model_dump(mode="json"),
         "workload_trace_hash": trace.hash(),
         "backend": config.backend.model_dump(mode="json"),
-        "hardware_profile": hardware_profile(),
+        "hardware_profile": profile,
+        "gpu_discovery": gpu_discovery,
+        "model_provenance": model_provenance(config),
         "python_version": sys.version,
         "operating_system": platform.platform(),
         "hostname": socket.gethostname(),
@@ -107,9 +156,18 @@ def initial_manifest(
         "start_time": utc_now_iso(),
         "end_time": None,
         "expected_requests": len(trace.requests),
+        "warmup_expected_requests": config.warmup.count,
+        "warmup_completed_requests": 0,
+        "warmup_failed_requests": 0,
+        "warmup_result_location": str(run_dir / "warmup_results.jsonl"),
         "completed_requests": 0,
         "failed_requests": 0,
         "raw_result_location": str(run_dir / "raw_results.jsonl"),
+        "telemetry_enabled": config.telemetry.enabled,
+        "telemetry_location": str(run_dir / "telemetry.jsonl"),
+        "telemetry_samples": 0,
+        "telemetry_complete": None,
+        "telemetry_errors": [],
         "run_directory": str(run_dir),
         "terminal_error": None,
     }

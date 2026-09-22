@@ -11,7 +11,9 @@ from heteroservebench.config import ExperimentConfig
 from heteroservebench.io import (
     MANIFEST_FILENAME,
     RAW_RESULTS_FILENAME,
+    TELEMETRY_FILENAME,
     TRACE_FILENAME,
+    WARMUP_RESULTS_FILENAME,
     append_raw_result,
     create_run_dir,
     refuse_to_overwrite_raw,
@@ -19,6 +21,7 @@ from heteroservebench.io import (
 from heteroservebench.manifest import initial_manifest, manifest_hash, new_run_id, utc_now_iso
 from heteroservebench.results import RequestResult
 from heteroservebench.serialization import write_json
+from heteroservebench.telemetry import TelemetrySampler
 from heteroservebench.workload import BenchmarkRequest, WorkloadTrace, generate_workload
 
 
@@ -87,6 +90,81 @@ async def replay_schedule(
     return await asyncio.gather(*tasks)
 
 
+def make_warmup_trace(trace: WorkloadTrace, count: int) -> WorkloadTrace:
+    """Create identifiable warm-up requests based on the measured workload shape."""
+    if count <= 0:
+        return WorkloadTrace([])
+    template = trace.requests[0]
+    requests = [
+        BenchmarkRequest(
+            request_id=f"warmup-{index:08d}",
+            workload_id=template.workload_id,
+            input_tokens=template.input_tokens,
+            requested_output_tokens=template.requested_output_tokens,
+            scheduled_arrival_time_s=0.0,
+            seed_metadata={"warmup": True, "sequence_index": index},
+        )
+        for index in range(count)
+    ]
+    return WorkloadTrace(requests)
+
+
+async def _run_with_optional_telemetry(
+    trace: WorkloadTrace,
+    backend: Backend,
+    raw_path: Path,
+    telemetry_path: Path,
+    telemetry_enabled: bool,
+    telemetry_interval_s: float,
+    slo_latency_ms: float | None,
+) -> tuple[list[RequestResult], dict]:
+    sampler = None
+    sampler_task = None
+    telemetry_status = {"samples": 0, "complete": None, "errors": []}
+    if telemetry_enabled:
+        sampler = TelemetrySampler(telemetry_path, telemetry_interval_s)
+        sampler_task = asyncio.create_task(sampler.run())
+    try:
+        results = await replay_schedule(trace, backend, raw_path, slo_latency_ms)
+    finally:
+        if sampler is not None and sampler_task is not None:
+            sampler.stop()
+            await sampler_task
+            telemetry_status = {
+                "samples": sampler.samples_written,
+                "complete": not sampler.errors,
+                "errors": sampler.errors,
+            }
+    return results, telemetry_status
+
+
+async def _execute_run(
+    config: ExperimentConfig,
+    trace: WorkloadTrace,
+    backend: Backend,
+    run_dir: Path,
+) -> tuple[list[RequestResult], list[RequestResult], dict]:
+    warmup_trace = make_warmup_trace(trace, config.warmup.count)
+    warmup_results: list[RequestResult] = []
+    if warmup_trace.requests:
+        warmup_results = await replay_schedule(
+            trace=warmup_trace,
+            backend=backend,
+            raw_path=run_dir / WARMUP_RESULTS_FILENAME,
+            slo_latency_ms=None,
+        )
+    measured_results, telemetry_status = await _run_with_optional_telemetry(
+        trace=trace,
+        backend=backend,
+        raw_path=run_dir / RAW_RESULTS_FILENAME,
+        telemetry_path=run_dir / TELEMETRY_FILENAME,
+        telemetry_enabled=config.telemetry.enabled,
+        telemetry_interval_s=config.telemetry.sampling_interval_s,
+        slo_latency_ms=None if config.slo is None else config.slo.latency_ms,
+    )
+    return warmup_results, measured_results, telemetry_status
+
+
 def run_experiment(config: ExperimentConfig) -> Path:
     """Execute an experiment and return its run directory."""
     trace = generate_workload(config)
@@ -100,14 +178,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     backend = create_backend(config.backend)
 
     try:
-        results = asyncio.run(
-            replay_schedule(
-                trace=trace,
-                backend=backend,
-                raw_path=raw_path,
-                slo_latency_ms=None if config.slo is None else config.slo.latency_ms,
-            )
-        )
+        warmup_results, results, telemetry_status = asyncio.run(_execute_run(config, trace, backend, run_dir))
     except BaseException as exc:
         manifest["run_status"] = "failed"
         manifest["terminal_error"] = {"type": type(exc).__name__, "message": str(exc)}
@@ -120,8 +191,13 @@ def run_experiment(config: ExperimentConfig) -> Path:
         write_json(manifest_path, manifest)
         raise
 
+    manifest["warmup_completed_requests"] = sum(1 for result in warmup_results if result.success)
+    manifest["warmup_failed_requests"] = sum(1 for result in warmup_results if not result.success)
     manifest["completed_requests"] = sum(1 for result in results if result.success)
     manifest["failed_requests"] = sum(1 for result in results if not result.success)
+    manifest["telemetry_samples"] = telemetry_status["samples"]
+    manifest["telemetry_complete"] = telemetry_status["complete"]
+    manifest["telemetry_errors"] = telemetry_status["errors"]
     manifest["run_status"] = "completed" if manifest["failed_requests"] == 0 else "completed_with_failures"
     manifest["end_time"] = utc_now_iso()
     manifest["manifest_hash"] = manifest_hash(manifest)

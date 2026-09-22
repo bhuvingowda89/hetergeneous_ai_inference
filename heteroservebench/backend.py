@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 
 from heteroservebench.config import BackendConfig, SimulatedBackendConfig, VllmBackendConfig
 from heteroservebench.results import RequestResult
+from heteroservebench.vllm_http import VllmHttpClient, http_error_type
 from heteroservebench.workload import BenchmarkRequest
 
 
@@ -96,24 +97,90 @@ class SimulatedBackend(Backend):
 
 
 class VllmBackend(Backend):
-    """Placeholder adapter for future vLLM integration."""
+    """vLLM OpenAI-compatible HTTP backend."""
 
     backend_type = "vllm"
     is_simulated = False
 
     def __init__(self, config: VllmBackendConfig) -> None:
         self.config = config
+        self.client = VllmHttpClient(config.base_url, config.request_timeout_s)
 
     async def infer(self, request: BenchmarkRequest) -> RequestResult:
-        raise NotImplementedError("vLLM execution is intentionally deferred to a later phase")
+        start_ns = time.monotonic_ns()
+        payload = self._payload(request)
+        try:
+            parsed = await asyncio.to_thread(self.client.stream_completion, payload)
+        except Exception as exc:
+            return RequestResult(
+                request_id=request.request_id,
+                workload_id=request.workload_id,
+                scheduled_arrival_time_s=request.scheduled_arrival_time_s,
+                backend_start_time_ns=start_ns,
+                completion_time_ns=time.monotonic_ns(),
+                success=False,
+                error_type=http_error_type(exc),
+                error_message=str(exc),
+                input_tokens=request.input_tokens,
+                requested_output_tokens=request.requested_output_tokens,
+                failure_classification="backend_error",
+                backend_metadata=self.metadata(),
+            )
+
+        completion_ns = parsed.completion_time_ns or time.monotonic_ns()
+        return RequestResult(
+            request_id=request.request_id,
+            workload_id=request.workload_id,
+            scheduled_arrival_time_s=request.scheduled_arrival_time_s,
+            backend_start_time_ns=start_ns,
+            first_token_time_ns=parsed.first_token_time_ns,
+            completion_time_ns=completion_ns,
+            success=True,
+            input_tokens=request.input_tokens,
+            requested_output_tokens=request.requested_output_tokens,
+            generated_tokens=parsed.generated_tokens,
+            token_event_time_ns=parsed.token_event_time_ns,
+            ttft_s=parsed.ttft_s(start_ns),
+            inter_token_latency_s=parsed.inter_token_latency_s(),
+            service_latency_s=(completion_ns - start_ns) / 1_000_000_000,
+            backend_metadata=self.metadata(),
+        )
+
+    def _payload(self, request: BenchmarkRequest) -> dict:
+        prompt = self._prompt(request)
+        payload = {
+            "model": self.config.model,
+            "prompt": prompt,
+            "max_tokens": min(self.config.max_tokens, request.requested_output_tokens),
+            "temperature": self.config.temperature,
+            "stream": self.config.stream,
+            "stream_options": {"include_usage": True},
+        }
+        if self.config.seed is not None:
+            payload["seed"] = self.config.seed
+        payload.update(self.config.extra_body)
+        return payload
+
+    @staticmethod
+    def _prompt(request: BenchmarkRequest) -> str:
+        words = max(1, request.input_tokens // 4)
+        return "Benchmark request. " + " ".join(["token"] * words)
 
     def metadata(self) -> dict:
         return {
             "type": self.backend_type,
             "is_simulated": self.is_simulated,
-            "endpoint": self.config.endpoint,
-            "model_id": self.config.model_id,
-            "adapter_status": "stub",
+            "base_url": self.config.base_url,
+            "model_id": self.config.model,
+            "requested_model_revision": self.config.requested_model_revision,
+            "tokenizer": self.config.tokenizer,
+            "dtype": self.config.dtype,
+            "quantization": self.config.quantization,
+            "tensor_parallel_size": self.config.tensor_parallel_size,
+            "max_model_len": self.config.max_model_len,
+            "serving_engine": "vllm",
+            "serving_engine_command": self.config.serving_engine_command,
+            "streaming": self.config.stream,
         }
 
 

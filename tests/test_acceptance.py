@@ -14,15 +14,21 @@ from heteroservebench.config import (
     SeedConfig,
     SimulatedBackendConfig,
     SLOConfig,
+    TelemetryConfig,
+    VllmBackendConfig,
+    WarmupConfig,
     WorkloadConfig,
     load_config,
 )
+from heteroservebench.gpu import parse_nvidia_smi_csv
 from heteroservebench.io import MANIFEST_FILENAME, RAW_RESULTS_FILENAME, SUMMARY_FILENAME, append_raw_result
+from heteroservebench.manifest import initial_manifest, manifest_hash
 from heteroservebench.metrics import summarize_run
 from heteroservebench.results import RequestResult
 from heteroservebench.runner import replay_schedule, run_experiment
 from heteroservebench.serialization import read_json, stable_hash, write_json
 from heteroservebench.validation import validate_run
+from heteroservebench.vllm_http import StreamingParseResult, observe_stream_event
 from heteroservebench.workload import generate_workload
 
 
@@ -43,6 +49,70 @@ def make_config(tmp_path: Path, *, seed: int = 123, request_count: int = 5, work
         slo=SLOConfig(latency_ms=10.0),
         output_dir=tmp_path,
     )
+
+
+def make_vllm_config(tmp_path: Path) -> ExperimentConfig:
+    return ExperimentConfig(
+        campaign_id="gpu-test",
+        experiment_id="vllm",
+        seed=SeedConfig(value=55),
+        workload=WorkloadConfig(id="W1"),
+        arrival=FixedIntervalArrivalConfig(interval_ms=1.0),
+        load=LoadConfig(request_count=1),
+        backend=VllmBackendConfig(
+            base_url="http://127.0.0.1:8000",
+            model="Qwen/Qwen3-4B-Instruct-2507",
+            tokenizer="Qwen/Qwen3-4B-Instruct-2507",
+            dtype="float16",
+            quantization=None,
+            tensor_parallel_size=1,
+            max_model_len=2048,
+            expected_gpu_count=1,
+        ),
+        telemetry=TelemetryConfig(enabled=False),
+        output_dir=tmp_path,
+    )
+
+
+def make_synthetic_vllm_run(tmp_path: Path, *, gpu_identity: bool = True, ttft_s: float = 0.01) -> Path:
+    config = make_vllm_config(tmp_path)
+    trace = generate_workload(config)
+    run_dir = tmp_path / "synthetic-vllm"
+    run_dir.mkdir()
+    manifest = initial_manifest(config, trace, "synthetic-vllm", run_dir)
+    manifest["run_status"] = "completed"
+    manifest["end_time"] = manifest["start_time"]
+    manifest["completed_requests"] = 1
+    manifest["failed_requests"] = 0
+    manifest["hardware_profile"]["visible_gpu_count"] = 1
+    if gpu_identity:
+        manifest["hardware_profile"]["gpu_name"] = "Tesla T4"
+        manifest["hardware_profile"]["gpu_uuid"] = "GPU-test"
+    else:
+        manifest["hardware_profile"]["gpu_name"] = None
+        manifest["hardware_profile"]["gpu_uuid"] = None
+    manifest["model_provenance"]["serving_engine_version"] = "0.test"
+    manifest["manifest_hash"] = manifest_hash(manifest)
+    write_json(run_dir / "planned_workload.json", trace.canonical())
+    result = RequestResult(
+        request_id="req-00000000",
+        workload_id="W1",
+        scheduled_arrival_time_s=0.0,
+        actual_dispatch_time_ns=100,
+        backend_start_time_ns=100,
+        first_token_time_ns=100 + int(ttft_s * 1_000_000_000),
+        completion_time_ns=100 + 20_000_000,
+        success=True,
+        input_tokens=128,
+        requested_output_tokens=128,
+        generated_tokens=3,
+        ttft_s=ttft_s,
+        service_latency_s=0.02,
+        end_to_end_latency_s=0.02,
+    )
+    append_raw_result(run_dir / RAW_RESULTS_FILENAME, result)
+    write_json(run_dir / MANIFEST_FILENAME, manifest)
+    return run_dir
 
 
 def issue_codes(report: dict) -> set[str]:
@@ -210,3 +280,110 @@ def test_t15_smoke_experiment_validates_successfully(tmp_path: Path) -> None:
     run_dir = run_experiment(config)
     report = validate_run(run_dir)
     assert report["valid"], report
+
+
+def test_t16_gpu_metadata_parsing() -> None:
+    parsed = parse_nvidia_smi_csv("0, Tesla T4, GPU-abc, 15109\n", driver_version="550.54", cuda_version="12.4")
+    assert parsed[0].name == "Tesla T4"
+    assert parsed[0].uuid == "GPU-abc"
+    assert parsed[0].memory_total_mb == 15109
+    assert parsed[0].driver_version == "550.54"
+
+
+def test_t17_vllm_streaming_parser_extracts_first_token_timing() -> None:
+    parsed = StreamingParseResult()
+    observe_stream_event(parsed, {"choices": [{"text": "hello"}]}, 1_000)
+    observe_stream_event(parsed, {"choices": [{"text": " world"}], "usage": {"completion_tokens": 2}}, 2_000)
+    observe_stream_event(parsed, {"done": True}, 3_000)
+    assert parsed.first_token_time_ns == 1_000
+    assert parsed.generated_tokens == 2
+    assert parsed.text == "hello world"
+    assert parsed.inter_token_latency_s() == pytest.approx(0.000001)
+
+
+def test_t18_ttft_exceeds_end_to_end_latency_validation(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path, ttft_s=0.03)
+    report = validate_run(run_dir)
+    assert "ttft_exceeds_latency" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_t19_missing_gpu_identity_invalidates_gpu_run(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path, gpu_identity=False)
+    report = validate_run(run_dir)
+    assert "missing_gpu_identity" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_t20_warmup_observations_are_excluded_from_measured_summary(tmp_path: Path) -> None:
+    config = make_config(tmp_path, request_count=3, workload_id="W1")
+    config.warmup = WarmupConfig(count=2)
+    run_dir = run_experiment(config)
+    summary = summarize_run(run_dir, write=False)
+    assert summary["request_count"] == 3
+    assert (run_dir / "warmup_results.jsonl").exists()
+    assert len((run_dir / "warmup_results.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_t21_telemetry_failure_does_not_delete_request_observations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.telemetry as telemetry
+
+    def fail_sample() -> dict:
+        raise RuntimeError("telemetry unavailable")
+
+    monkeypatch.setattr(telemetry, "sample_gpu_telemetry", fail_sample)
+    config = make_config(tmp_path, request_count=2, workload_id="W1")
+    config.backend.service_latency_ms = 20.0
+    config.telemetry = TelemetryConfig(enabled=True, sampling_interval_s=0.001)
+    run_dir = run_experiment(config)
+    assert len((run_dir / RAW_RESULTS_FILENAME).read_text(encoding="utf-8").splitlines()) == 2
+    manifest = read_json(run_dir / MANIFEST_FILENAME)
+    assert manifest["telemetry_errors"]
+
+
+def test_t22_model_provenance_fields_are_preserved(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    provenance = read_json(run_dir / MANIFEST_FILENAME)["model_provenance"]
+    assert provenance["model_id"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert provenance["dtype"] == "float16"
+    assert provenance["quantization"] is None
+    assert provenance["tensor_parallel_size"] == 1
+
+
+def test_t23_nullable_unavailable_token_metrics_are_handled_correctly(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    raw_path = run_dir / RAW_RESULTS_FILENAME
+    raw_path.unlink()
+    append_raw_result(
+        raw_path,
+        RequestResult(
+            request_id="req-00000000",
+            workload_id="W1",
+            scheduled_arrival_time_s=0.0,
+            actual_dispatch_time_ns=100,
+            backend_start_time_ns=100,
+            first_token_time_ns=200,
+            completion_time_ns=300,
+            success=True,
+            input_tokens=128,
+            requested_output_tokens=128,
+            generated_tokens=None,
+            ttft_s=0.0000001,
+            end_to_end_latency_s=0.0000002,
+        ),
+    )
+    report = validate_run(run_dir)
+    assert report["valid"]
+    assert "generated_token_count_unavailable" in issue_codes(report)
+
+
+def test_t24_gpu_configuration_canonical_hashing_remains_stable(tmp_path: Path) -> None:
+    config = make_vllm_config(tmp_path)
+    assert config.config_hash() == make_vllm_config(tmp_path).config_hash()
+
+
+def test_t25_existing_cpu_smoke_test_still_passes_without_gpu_dependencies(tmp_path: Path) -> None:
+    config = load_config(Path("configs/smoke/cpu_smoke.yaml"))
+    config.output_dir = tmp_path
+    run_dir = run_experiment(config)
+    assert validate_run(run_dir)["valid"]

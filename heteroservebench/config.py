@@ -47,6 +47,15 @@ class BatchingConfig(StrictModel):
     max_wait_ms: float = Field(default=0.0, ge=0)
 
 
+class WarmupConfig(StrictModel):
+    count: int = Field(default=0, ge=0)
+
+
+class TelemetryConfig(StrictModel):
+    enabled: bool = False
+    sampling_interval_s: float = Field(default=1.0, gt=0)
+
+
 class WorkloadConfig(StrictModel):
     id: Literal["W1", "W2", "W3", "W4", "W5", "W6"]
     probabilities: Optional[dict[Literal["W1", "W2", "W3", "W4", "W5"], float]] = None
@@ -80,8 +89,26 @@ class SimulatedBackendConfig(StrictModel):
 
 class VllmBackendConfig(StrictModel):
     type: Literal["vllm"] = "vllm"
-    endpoint: str
-    model_id: str
+    base_url: str
+    model: str
+    requested_model_revision: Optional[str] = None
+    tokenizer: Optional[str] = None
+    request_timeout_s: float = Field(default=120.0, gt=0)
+    max_tokens: int = Field(default=128, gt=0)
+    temperature: float = Field(default=0.0, ge=0)
+    seed: Optional[int] = Field(default=None, ge=0)
+    stream: bool = True
+    allow_retries: bool = False
+    dtype: str = Field(min_length=1)
+    quantization: Optional[str] = None
+    tensor_parallel_size: int = Field(default=1, gt=0)
+    max_model_len: int = Field(gt=0)
+    selected_cuda_device: Optional[str] = None
+    expected_gpu_count: Optional[int] = Field(default=None, ge=1)
+    expected_gpu_name: Optional[str] = None
+    expected_gpu_uuid: Optional[str] = None
+    serving_engine_command: Optional[str] = None
+    extra_body: dict = Field(default_factory=dict)
 
 
 BackendConfig = Union[SimulatedBackendConfig, VllmBackendConfig]
@@ -96,6 +123,8 @@ class ExperimentConfig(StrictModel):
     arrival: ArrivalConfig = Field(discriminator="type")
     load: LoadConfig
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
+    warmup: WarmupConfig = Field(default_factory=WarmupConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     backend: BackendConfig = Field(discriminator="type")
     slo: Optional[SLOConfig] = None
     output_dir: Path

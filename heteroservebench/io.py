@@ -9,6 +9,8 @@ from heteroservebench.results import RequestResult
 
 
 RAW_RESULTS_FILENAME = "raw_results.jsonl"
+WARMUP_RESULTS_FILENAME = "warmup_results.jsonl"
+TELEMETRY_FILENAME = "telemetry.jsonl"
 MANIFEST_FILENAME = "manifest.json"
 TRACE_FILENAME = "planned_workload.json"
 SUMMARY_FILENAME = "summary.json"

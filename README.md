@@ -54,11 +54,33 @@ python -m heteroservebench summarize --run-dir runs/<run_id>
 
 Summaries include only basic derived metrics: counts, throughput, latency percentiles, mean latency, and SLO attainment when configured. Analysis code refuses to overwrite existing summary files and never rewrites raw results.
 
+## Phase 3A GPU Smoke
+
+GPU/vLLM support is optional and uses vLLM's OpenAI-compatible HTTP server. The base package still runs CPU tests without CUDA, PyTorch, or vLLM.
+
+```bash
+pip install -e ".[gpu]"
+CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --served-model-name Qwen/Qwen3-4B-Instruct-2507 \
+  --tensor-parallel-size 1 \
+  --dtype float16 \
+  --max-model-len 2048 \
+  --host 0.0.0.0 \
+  --port 8000
+python -m heteroservebench run --config configs/gpu/t4_qwen3_4b_smoke.yaml
+```
+
+See `docs/KAGGLE_T4.md` for the full single-T4 Kaggle procedure. Phase 3A is device validation only, not scientific benchmarking.
+
 ## Repository Organization
 
 - `heteroservebench/config.py` - validated configuration schemas.
 - `heteroservebench/workload.py` - deterministic request trace generation.
 - `heteroservebench/backend.py` - backend interface, simulator, and vLLM stub.
+- `heteroservebench/gpu.py` - NVIDIA GPU discovery helpers.
+- `heteroservebench/telemetry.py` - best-effort GPU/host telemetry sampling.
+- `heteroservebench/vllm_http.py` - OpenAI-compatible streaming vLLM HTTP client.
 - `heteroservebench/runner.py` - asynchronous load generation and run orchestration.
 - `heteroservebench/results.py` - raw request observation schema.
 - `heteroservebench/manifest.py` - provenance manifest generation.
