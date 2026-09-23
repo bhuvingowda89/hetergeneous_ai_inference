@@ -7,6 +7,18 @@ from pathlib import Path
 import pytest
 
 from heteroservebench.backend import BackendError, SimulatedBackend, VllmBackend
+from heteroservebench.calibration import (
+    MAX_PROBE_RPS,
+    MIN_PROBE_RPS,
+    ProbeOutcome,
+    adaptive_search,
+    derived_probe_config,
+    dry_run_plan,
+    initial_offered_rps,
+    interval_ms_for_rate,
+    is_sustainable_probe,
+)
+from heteroservebench.cli import main
 from heteroservebench.config import (
     ExperimentConfig,
     FixedIntervalArrivalConfig,
@@ -781,3 +793,194 @@ def test_external_vllm_command_provenance_is_verbatim(tmp_path: Path) -> None:
         "CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-4B-Instruct-2507 --host 127.0.0.1 --port 8000"
     )
     assert "entrypoints.openai.api_server" not in provenance["serving_engine_command"]
+
+
+def outcome(rate: float, *, sustainable: bool = True, validation_valid: bool = True, failures: int = 0) -> ProbeOutcome:
+    successes = 8 - failures if sustainable or failures else 8
+    throughput_ratio = 1.0 if sustainable else 0.80
+    return ProbeOutcome(
+        offered_rps=rate,
+        strict_validation_valid=validation_valid,
+        success_count=successes,
+        failure_count=failures,
+        measured_request_count=8,
+        achieved_throughput_rps=rate * throughput_ratio,
+        throughput_ratio=throughput_ratio,
+    )
+
+
+def test_calibration_initial_rate_computed_from_l0() -> None:
+    assert initial_offered_rps(2.0) == pytest.approx(1.0)
+
+
+def test_calibration_initial_rate_clamps_lower_and_upper() -> None:
+    assert initial_offered_rps(1000.0) == pytest.approx(MIN_PROBE_RPS)
+    assert initial_offered_rps(0.01) == pytest.approx(4.0)
+
+
+def test_sustainable_classification_accepts_valid_probe() -> None:
+    assert is_sustainable_probe(outcome(1.0))
+
+
+def test_throughput_ratio_rejection() -> None:
+    assert not is_sustainable_probe(outcome(1.0, sustainable=False))
+
+
+def test_failure_rejection() -> None:
+    assert not is_sustainable_probe(outcome(1.0, failures=1))
+
+
+def test_strict_validation_rejection() -> None:
+    assert not is_sustainable_probe(outcome(1.0, validation_valid=False))
+
+
+def test_adaptive_search_rate_doubling() -> None:
+    rates = []
+
+    def probe(rate: float, probe_type: str) -> ProbeOutcome:
+        rates.append(rate)
+        return outcome(rate, sustainable=rate < 4.0)
+
+    result = adaptive_search(1.0, probe, max_refinement_probes=0)
+    assert rates[:3] == [1.0, 2.0, 4.0]
+    assert result.highest_sustainable_rps == 2.0
+    assert result.first_non_sustainable_rps == 4.0
+
+
+def test_adaptive_search_rate_halving() -> None:
+    rates = []
+
+    def probe(rate: float, probe_type: str) -> ProbeOutcome:
+        rates.append(rate)
+        return outcome(rate, sustainable=rate <= 1.0)
+
+    result = adaptive_search(4.0, probe, max_refinement_probes=0)
+    assert rates[:3] == [4.0, 2.0, 1.0]
+    assert result.highest_sustainable_rps == 1.0
+    assert result.first_non_sustainable_rps == 2.0
+
+
+def test_geometric_midpoint_refinement() -> None:
+    rates = []
+
+    def probe(rate: float, probe_type: str) -> ProbeOutcome:
+        rates.append(rate)
+        return outcome(rate, sustainable=rate < 4.0)
+
+    adaptive_search(1.0, probe, max_refinement_probes=1)
+    assert rates == [1.0, 2.0, 4.0, pytest.approx(2.8284271247461903)]
+
+
+def test_bracket_ratio_stopping_rule() -> None:
+    calls = []
+
+    def probe(rate: float, probe_type: str) -> ProbeOutcome:
+        calls.append((rate, probe_type))
+        return outcome(rate, sustainable=rate < 10.0)
+
+    result = adaptive_search(8.0, probe, maximum_rps=10.0, max_refinement_probes=3)
+    assert [call[0] for call in calls] == [8.0, 10.0]
+    assert result.highest_sustainable_rps == 8.0
+
+
+def test_adaptive_search_honors_10_probe_cap() -> None:
+    result = adaptive_search(0.01, lambda rate, probe_type: outcome(rate), max_open_loop_probes=10)
+    assert len(result.probes) == 10
+
+
+def test_lower_bound_behavior_at_max_rate() -> None:
+    result = adaptive_search(8.0, lambda rate, probe_type: outcome(rate))
+    assert result.capacity_is_lower_bound
+    assert result.capacity_rps == MAX_PROBE_RPS
+    assert result.first_non_sustainable_rps is None
+
+
+def test_failure_when_no_sustainable_point_exists_at_minimum_rate() -> None:
+    result = adaptive_search(0.01, lambda rate, probe_type: outcome(rate, sustainable=False))
+    assert result.calibration_failed
+    assert result.capacity_rps is None
+
+
+def test_derived_probe_config_preserves_exact_token_revision_settings(tmp_path: Path) -> None:
+    base = make_vllm_config(tmp_path)
+    base.validation_mode = "scientific"
+    base.backend.exact_output_tokens = True
+    base.backend.requested_model_revision = "revision"
+    base.backend.selected_cuda_device = "0"
+    derived = derived_probe_config(
+        base,
+        "W4",
+        offered_rps=2.5,
+        measured_requests=8,
+        warmup_requests=1,
+        output_dir=tmp_path / "cal",
+        experiment_suffix="probe",
+    )
+    assert derived.validation_mode == "scientific"
+    assert derived.backend.exact_output_tokens is True
+    assert derived.backend.requested_model_revision == "revision"
+    assert derived.backend.selected_cuda_device == "0"
+    assert derived.backend.max_tokens == base.backend.max_tokens
+
+
+def test_calibration_interval_ms_is_1000_div_offered_rps(tmp_path: Path) -> None:
+    base = make_vllm_config(tmp_path)
+    derived = derived_probe_config(
+        base,
+        "W1",
+        offered_rps=2.5,
+        measured_requests=8,
+        warmup_requests=1,
+        output_dir=tmp_path,
+        experiment_suffix="probe",
+    )
+    assert interval_ms_for_rate(2.5) == pytest.approx(400.0)
+    assert derived.arrival.interval_ms == pytest.approx(400.0)
+
+
+def test_derived_probe_config_does_not_mutate_base_config(tmp_path: Path) -> None:
+    base = make_vllm_config(tmp_path)
+    before = copy = base.canonical()
+    derived_probe_config(
+        base,
+        "W4",
+        offered_rps=1.0,
+        measured_requests=8,
+        warmup_requests=1,
+        output_dir=tmp_path / "cal",
+        experiment_suffix="probe",
+    )
+    assert base.canonical() == before
+    assert copy["workload"]["id"] == "W1"
+
+
+def test_dry_run_plan_works_without_server_or_gpu(tmp_path: Path) -> None:
+    base = make_vllm_config(tmp_path)
+    plan = dry_run_plan(base, ["W1"], assumed_l0_s=2.0)
+    workload = plan["workloads"][0]
+    assert workload["workload_id"] == "W1"
+    assert workload["proposed_initial_offered_rps"] == pytest.approx(1.0)
+    assert workload["derived_configuration"]["backend"]["model"] == base.backend.model
+
+
+def test_calibrate_cli_dry_run_works_without_server_or_gpu(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "calibrate",
+            "--config",
+            "configs/gpu/t4_qwen3_4b_smoke.yaml",
+            "--workloads",
+            "W1",
+            "--dry-run",
+            "--dry-run-l0-s",
+            "2.0",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert '"dry_run": true' in captured.out
+    assert '"proposed_initial_offered_rps": 1.0' in captured.out
+
+
+def test_calibration_runs_are_gitignored() -> None:
+    assert "calibration_runs/" in Path(".gitignore").read_text(encoding="utf-8")
