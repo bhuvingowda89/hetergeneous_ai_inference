@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from heteroservebench.backend import SimulatedBackend, VllmBackend
+from heteroservebench.backend import BackendError, SimulatedBackend, VllmBackend
 from heteroservebench.config import (
     ExperimentConfig,
     FixedIntervalArrivalConfig,
@@ -64,6 +64,7 @@ def make_vllm_config(tmp_path: Path) -> ExperimentConfig:
             base_url="http://127.0.0.1:8000",
             model="Qwen/Qwen3-4B-Instruct-2507",
             tokenizer="Qwen/Qwen3-4B-Instruct-2507",
+            max_tokens=512,
             dtype="float16",
             quantization=None,
             tensor_parallel_size=1,
@@ -581,6 +582,125 @@ def test_vllm_prompt_uses_configured_tokenizer_and_revision(tmp_path: Path, monk
     assert calls == [("tokenizer/test", "abc123")]
     assert actual_prompt_tokens == 128
     assert payload["prompt"] == "a" * 128
+
+
+@pytest.mark.parametrize(
+    ("workload_id", "input_tokens", "requested_output_tokens"),
+    [("W1", 128, 128), ("W4", 128, 512), ("W5", 512, 512)],
+)
+def test_exact_output_payload_uses_workload_output_tokens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workload_id: str,
+    input_tokens: int,
+    requested_output_tokens: int,
+) -> None:
+    import heteroservebench.backend as backend_module
+
+    monkeypatch.setattr(backend_module, "load_tokenizer", lambda identifier, revision: FakeTokenizer())
+    config = make_vllm_config(tmp_path)
+    config.backend.exact_output_tokens = True
+    backend = VllmBackend(config.backend)
+    payload, _ = backend._payload(
+        BenchmarkRequest(
+            request_id="req",
+            workload_id=workload_id,
+            input_tokens=input_tokens,
+            requested_output_tokens=requested_output_tokens,
+            scheduled_arrival_time_s=0.0,
+        )
+    )
+    assert payload["max_tokens"] == requested_output_tokens
+    assert payload["min_tokens"] == requested_output_tokens
+    assert payload["ignore_eos"] is True
+
+
+def test_requested_output_above_configured_cap_fails_preflight(tmp_path: Path) -> None:
+    config = make_vllm_config(tmp_path)
+    config.workload = WorkloadConfig(id="W4")
+    config.backend.max_tokens = 128
+    with pytest.raises(ValueError) as exc_info:
+        validate_context_capacity(config, generate_workload(config))
+    message = str(exc_info.value)
+    assert "requested_output_tokens=512" in message
+    assert "configured_max_tokens=128" in message
+
+
+def test_exact_output_mode_does_not_silently_clamp_to_global_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.backend as backend_module
+
+    monkeypatch.setattr(backend_module, "load_tokenizer", lambda identifier, revision: FakeTokenizer())
+    config = make_vllm_config(tmp_path)
+    config.backend.exact_output_tokens = True
+    config.backend.max_tokens = 512
+    backend = VllmBackend(config.backend)
+    payload, _ = backend._payload(
+        BenchmarkRequest(
+            request_id="req",
+            workload_id="W4",
+            input_tokens=128,
+            requested_output_tokens=512,
+            scheduled_arrival_time_s=0.0,
+        )
+    )
+    assert payload["max_tokens"] == 512
+
+
+def test_scientific_vllm_config_rejects_exact_output_disabled(tmp_path: Path) -> None:
+    config = make_vllm_config(tmp_path)
+    config.validation_mode = "scientific"
+    config.backend.exact_output_tokens = False
+    with pytest.raises(ValueError, match="exact_output_tokens=true"):
+        validate_context_capacity(config, generate_workload(config))
+
+
+def test_scientific_validation_rejects_generated_token_mismatch(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    manifest_path = run_dir / MANIFEST_FILENAME
+    manifest = read_json(manifest_path)
+    manifest["validation_mode"] = "scientific"
+    manifest["canonical_configuration"]["validation_mode"] = "scientific"
+    manifest["model_provenance"]["resolved_model_revision_hash"] = "model-commit"
+    manifest["config_hash"] = stable_hash(manifest["canonical_configuration"])
+    manifest["manifest_hash"] = manifest_hash(manifest)
+    write_json(manifest_path, manifest)
+    raw_path = run_dir / RAW_RESULTS_FILENAME
+    row = json.loads(raw_path.read_text(encoding="utf-8").splitlines()[0])
+    row["generated_tokens"] = 127
+    raw_path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+    report = validate_run(run_dir)
+    assert "output_token_count_mismatch" in issue_codes(report)
+    assert not report["valid"]
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "min_tokens", "ignore_eos"])
+def test_extra_body_cannot_override_exact_output_controls(tmp_path: Path, field: str) -> None:
+    config = make_vllm_config(tmp_path)
+    config.backend.exact_output_tokens = True
+    config.backend.extra_body[field] = 1
+    with pytest.raises(ValueError) as exc_info:
+        validate_context_capacity(config, generate_workload(config))
+    assert field in str(exc_info.value)
+
+
+def test_exact_output_payload_rejects_extra_body_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.backend as backend_module
+
+    monkeypatch.setattr(backend_module, "load_tokenizer", lambda identifier, revision: FakeTokenizer())
+    config = make_vllm_config(tmp_path)
+    config.backend.exact_output_tokens = True
+    config.backend.extra_body["max_tokens"] = 1
+    backend = VllmBackend(config.backend)
+    with pytest.raises(BackendError, match="max_tokens"):
+        backend._payload(
+            BenchmarkRequest(
+                request_id="req",
+                workload_id="W1",
+                input_tokens=128,
+                requested_output_tokens=128,
+                scheduled_arrival_time_s=0.0,
+            )
+        )
 
 
 def test_requested_actual_prompt_token_mismatch_is_detected(tmp_path: Path) -> None:

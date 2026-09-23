@@ -219,6 +219,18 @@ def validate_run(run_dir: Path, *, strict_scientific: bool = False) -> dict:
                             },
                         )
                     )
+                if validation_mode == "scientific" and result.generated_tokens != result.requested_output_tokens:
+                    issues.append(
+                        _issue(
+                            "output_token_count_mismatch",
+                            "generated tokens do not match requested output tokens",
+                            context={
+                                "request_id": result.request_id,
+                                "requested_output_tokens": result.requested_output_tokens,
+                                "generated_tokens": result.generated_tokens,
+                            },
+                        )
+                    )
                 if result.generated_tokens is None:
                     issues.append(_issue("generated_token_count_unavailable", "generated token count was not exposed by backend", severity="warning", context={"request_id": result.request_id}))
 

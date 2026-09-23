@@ -74,7 +74,7 @@ python -m heteroservebench run --config configs/gpu/t4_qwen3_4b_smoke.yaml
 
 Phase 3C pins the GPU extra to the verified serving engine `vLLM 0.27.1`. On Tesla T4, vLLM falls back to TRITON_ATTN because FlashAttention-2 is unavailable on compute capability 7.5. Use `CUDA_VISIBLE_DEVICES=0` to isolate one benchmark-visible GPU even when Kaggle exposes two physical T4s.
 
-Scientific GPU runs require exact tokenizer-level prompts. Each request records `requested_input_tokens`, `actual_prompt_tokens`, and, when vLLM reports it, `provider_prompt_tokens`; validation fails if these disagree. Scientific runs must also pin a real Hugging Face model revision and resolve a snapshot hash in the manifest. Smoke/exploratory runs may leave the revision unresolved, but validation reports a warning.
+Scientific GPU runs require exact tokenizer-level prompts and fixed completion lengths. Each request records `requested_input_tokens`, `actual_prompt_tokens`, and, when vLLM reports it, `provider_prompt_tokens`; validation fails if these disagree. Scientific vLLM runs must enable `exact_output_tokens`, which sends per-request `max_tokens`, `min_tokens`, and `ignore_eos` controls so W1-W5 use their canonical completion lengths instead of a global clamp. Scientific runs must also pin a real Hugging Face model revision and resolve a snapshot hash in the manifest. Smoke/exploratory runs may leave the revision unresolved, but validation reports a warning.
 
 See `docs/KAGGLE_T4.md` for the full single-T4 Kaggle procedure. Smoke runs validate infrastructure only, not scientific benchmarking.
 

@@ -81,7 +81,7 @@ python -m heteroservebench summarize --run-dir "$RUN_DIR"
 
 Smoke/exploratory validation permits unresolved model revision hashes with a warning. For scientific runs, set `validation_mode: "scientific"` and configure a real `backend.requested_model_revision`; validation fails if `resolved_model_revision_hash` is absent.
 
-Every GPU request must use an exact tokenizer-level prompt length. Raw results record `requested_input_tokens`, `actual_prompt_tokens`, and `provider_prompt_tokens` when vLLM reports usage. Scientific/GPU validation fails token-count mismatches instead of silently accepting approximations.
+Every GPU request must use an exact tokenizer-level prompt length. Scientific vLLM workloads also use fixed completion lengths with `exact_output_tokens: true`; the client sends each request's canonical output length as `max_tokens` and `min_tokens` with `ignore_eos` enabled. Raw results record `requested_input_tokens`, `actual_prompt_tokens`, and `provider_prompt_tokens` when vLLM reports usage. Scientific/GPU validation fails token-count mismatches instead of silently accepting approximations.
 
 ## 9. Archive Artifacts
 

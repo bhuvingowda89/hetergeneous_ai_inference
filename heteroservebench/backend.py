@@ -22,6 +22,9 @@ class BackendError(RuntimeError):
     """Backend request failure."""
 
 
+EXACT_OUTPUT_CONTROL_FIELDS = {"max_tokens", "min_tokens", "ignore_eos"}
+
+
 class Backend(ABC):
     """Generic inference backend interface."""
 
@@ -180,14 +183,24 @@ class VllmBackend(Backend):
 
     def _payload(self, request: BenchmarkRequest) -> tuple[dict, int]:
         prompt = self._prompt(request)
+        exact_output_overrides = EXACT_OUTPUT_CONTROL_FIELDS.intersection(self.config.extra_body)
+        if self.config.exact_output_tokens and exact_output_overrides:
+            fields = ", ".join(sorted(exact_output_overrides))
+            raise BackendError(f"extra_body cannot override exact-output controls: {fields}")
+        max_tokens = min(self.config.max_tokens, request.requested_output_tokens)
+        if self.config.exact_output_tokens:
+            max_tokens = request.requested_output_tokens
         payload = {
             "model": self.config.model,
             "prompt": prompt.text,
-            "max_tokens": min(self.config.max_tokens, request.requested_output_tokens),
+            "max_tokens": max_tokens,
             "temperature": self.config.temperature,
             "stream": self.config.stream,
             "stream_options": {"include_usage": True},
         }
+        if self.config.exact_output_tokens:
+            payload["min_tokens"] = request.requested_output_tokens
+            payload["ignore_eos"] = True
         if self.config.seed is not None:
             payload["seed"] = self.config.seed
         payload.update(self.config.extra_body)

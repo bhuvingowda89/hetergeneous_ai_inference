@@ -6,7 +6,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from heteroservebench.backend import Backend, create_backend
+from heteroservebench.backend import EXACT_OUTPUT_CONTROL_FIELDS, Backend, create_backend
 from heteroservebench.config import ExperimentConfig
 from heteroservebench.io import (
     MANIFEST_FILENAME,
@@ -111,11 +111,26 @@ def make_warmup_trace(trace: WorkloadTrace, count: int) -> WorkloadTrace:
 
 
 def validate_context_capacity(config: ExperimentConfig, trace: WorkloadTrace) -> None:
-    """Reject vLLM requests that cannot fit within configured model context."""
+    """Reject vLLM requests that cannot satisfy configured token constraints."""
     if config.backend.type != "vllm":
         return
+    if config.validation_mode == "scientific" and not config.backend.exact_output_tokens:
+        raise ValueError("scientific vLLM runs require exact_output_tokens=true")
+    if config.backend.exact_output_tokens:
+        exact_output_overrides = EXACT_OUTPUT_CONTROL_FIELDS.intersection(config.backend.extra_body)
+        if exact_output_overrides:
+            fields = ", ".join(sorted(exact_output_overrides))
+            raise ValueError(f"extra_body cannot override exact-output controls: {fields}")
     max_model_len = config.backend.max_model_len
     for request in trace.requests:
+        if request.requested_output_tokens > config.backend.max_tokens:
+            raise ValueError(
+                "requested output tokens exceed configured backend max_tokens: "
+                f"request_id={request.request_id}, "
+                f"workload_id={request.workload_id}, "
+                f"requested_output_tokens={request.requested_output_tokens}, "
+                f"configured_max_tokens={config.backend.max_tokens}"
+            )
         required_context_length = request.input_tokens + request.requested_output_tokens
         if required_context_length > max_model_len:
             raise ValueError(

@@ -95,6 +95,7 @@ class VllmBackendConfig(StrictModel):
     tokenizer: Optional[str] = None
     request_timeout_s: float = Field(default=120.0, gt=0)
     max_tokens: int = Field(default=128, gt=0)
+    exact_output_tokens: bool = False
     temperature: float = Field(default=0.0, ge=0)
     seed: Optional[int] = Field(default=None, ge=0)
     stream: bool = True
