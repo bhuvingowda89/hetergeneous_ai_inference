@@ -17,6 +17,7 @@ from heteroservebench import __version__
 from heteroservebench.config import ExperimentConfig
 from heteroservebench.gpu import discover_nvidia_gpus, primary_gpu_profile
 from heteroservebench.serialization import stable_hash
+from heteroservebench.tokenizer_prompt import resolve_hf_snapshot_revision, tokenizer_identifier
 from heteroservebench.workload import WorkloadTrace
 
 
@@ -91,11 +92,13 @@ def model_provenance(config: ExperimentConfig) -> dict[str, Any]:
             "requested_model_revision": None,
             "resolved_model_revision_hash": None,
             "tokenizer_identifier": None,
+            "tokenizer_resolved_revision_hash": None,
             "dtype": None,
             "quantization": None,
             "tensor_parallel_size": None,
             "serving_engine": None,
             "serving_engine_version": None,
+            "serving_mode": None,
             "serving_engine_command": None,
             "max_model_len": None,
             "warnings": [],
@@ -103,16 +106,23 @@ def model_provenance(config: ExperimentConfig) -> dict[str, Any]:
     warnings = []
     if config.backend.requested_model_revision is None:
         warnings.append("requested model revision is not specified")
+    tokenizer_id = tokenizer_identifier(config.backend.model, config.backend.tokenizer)
+    resolved_model_revision = resolve_hf_snapshot_revision(config.backend.model, config.backend.requested_model_revision)
+    resolved_tokenizer_revision = resolve_hf_snapshot_revision(tokenizer_id, config.backend.requested_model_revision)
+    if resolved_model_revision is None:
+        warnings.append("resolved model revision/hash is unavailable")
     return {
         "model_id": config.backend.model,
         "requested_model_revision": config.backend.requested_model_revision,
-        "resolved_model_revision_hash": None,
-        "tokenizer_identifier": config.backend.tokenizer or config.backend.model,
+        "resolved_model_revision_hash": resolved_model_revision,
+        "tokenizer_identifier": tokenizer_id,
+        "tokenizer_resolved_revision_hash": resolved_tokenizer_revision,
         "dtype": config.backend.dtype,
         "quantization": config.backend.quantization,
         "tensor_parallel_size": config.backend.tensor_parallel_size,
         "serving_engine": "vllm",
         "serving_engine_version": package_metadata().get("vllm"),
+        "serving_mode": config.backend.serving_mode,
         "serving_engine_command": config.backend.serving_engine_command,
         "max_model_len": config.backend.max_model_len,
         "warnings": warnings,
@@ -129,13 +139,16 @@ def initial_manifest(
     canonical_config = config.canonical()
     profile = hardware_profile()
     gpu_discovery = None
+    provenance = model_provenance(config)
     if config.backend.type == "vllm":
         gpu_discovery = discover_nvidia_gpus()
         profile.update(primary_gpu_profile(gpu_discovery, config.backend.selected_cuda_device))
         profile["model_id"] = config.backend.model
         profile["vllm_version"] = package_metadata().get("vllm")
+        profile["model_revision_hash"] = provenance.get("resolved_model_revision_hash")
     return {
         "schema_version": "1.0",
+        "validation_mode": config.validation_mode,
         "campaign_id": config.campaign_id,
         "run_id": run_id,
         "timestamp": utc_now_iso(),
@@ -149,7 +162,7 @@ def initial_manifest(
         "backend": config.backend.model_dump(mode="json"),
         "hardware_profile": profile,
         "gpu_discovery": gpu_discovery,
-        "model_provenance": model_provenance(config),
+        "model_provenance": provenance,
         "python_version": sys.version,
         "operating_system": platform.platform(),
         "hostname": socket.gethostname(),

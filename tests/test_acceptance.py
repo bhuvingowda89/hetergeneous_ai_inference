@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from heteroservebench.backend import SimulatedBackend
+from heteroservebench.backend import SimulatedBackend, VllmBackend
 from heteroservebench.config import (
     ExperimentConfig,
     FixedIntervalArrivalConfig,
@@ -25,11 +25,12 @@ from heteroservebench.io import MANIFEST_FILENAME, RAW_RESULTS_FILENAME, SUMMARY
 from heteroservebench.manifest import initial_manifest, manifest_hash
 from heteroservebench.metrics import summarize_run
 from heteroservebench.results import RequestResult
-from heteroservebench.runner import replay_schedule, run_experiment
+from heteroservebench.runner import replay_schedule, run_experiment, validate_context_capacity
 from heteroservebench.serialization import read_json, stable_hash, write_json
+from heteroservebench.tokenizer_prompt import construct_exact_prompt
 from heteroservebench.validation import validate_run
 from heteroservebench.vllm_http import StreamingParseResult, observe_stream_event
-from heteroservebench.workload import generate_workload
+from heteroservebench.workload import BenchmarkRequest, WorkloadTrace, generate_workload
 
 
 def make_config(tmp_path: Path, *, seed: int = 123, request_count: int = 5, workload_id: str = "W6") -> ExperimentConfig:
@@ -66,8 +67,9 @@ def make_vllm_config(tmp_path: Path) -> ExperimentConfig:
             dtype="float16",
             quantization=None,
             tensor_parallel_size=1,
-            max_model_len=2048,
+            max_model_len=4096,
             expected_gpu_count=1,
+            serving_engine_command="CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-4B-Instruct-2507 --host 127.0.0.1 --port 8000",
         ),
         telemetry=TelemetryConfig(enabled=False),
         output_dir=tmp_path,
@@ -119,6 +121,9 @@ def make_synthetic_vllm_run(tmp_path: Path, *, gpu_identity: bool = True, ttft_s
         completion_time_ns=100 + 20_000_000,
         success=True,
         input_tokens=128,
+        requested_input_tokens=128,
+        actual_prompt_tokens=128,
+        provider_prompt_tokens=128,
         requested_output_tokens=128,
         generated_tokens=3,
         ttft_s=ttft_s,
@@ -132,6 +137,19 @@ def make_synthetic_vllm_run(tmp_path: Path, *, gpu_identity: bool = True, ttft_s
 
 def issue_codes(report: dict) -> set[str]:
     return {issue["code"] for issue in report["issues"]}
+
+
+class FakeTokenizer:
+    name_or_path = "fake-tokenizer"
+    vocab_size = 4
+    all_special_ids = [0]
+
+    def decode(self, token_ids, clean_up_tokenization_spaces=False):
+        pieces = {0: "", 1: "a", 2: "b", 3: " "}
+        return "".join(pieces[token_id] for token_id in token_ids)
+
+    def encode(self, text, add_special_tokens=False):
+        return [1 for _ in text]
 
 
 def test_t1_identical_seed_produces_identical_workload_trace(tmp_path: Path) -> None:
@@ -308,10 +326,11 @@ def test_t16_gpu_metadata_parsing() -> None:
 def test_t17_vllm_streaming_parser_extracts_first_token_timing() -> None:
     parsed = StreamingParseResult()
     observe_stream_event(parsed, {"choices": [{"text": "hello"}]}, 1_000)
-    observe_stream_event(parsed, {"choices": [{"text": " world"}], "usage": {"completion_tokens": 2}}, 2_000)
+    observe_stream_event(parsed, {"choices": [{"text": " world"}], "usage": {"completion_tokens": 2, "prompt_tokens": 128}}, 2_000)
     observe_stream_event(parsed, {"done": True}, 3_000)
     assert parsed.first_token_time_ns == 1_000
     assert parsed.generated_tokens == 2
+    assert parsed.provider_prompt_tokens == 128
     assert parsed.text == "hello world"
     assert parsed.inter_token_latency_s() == pytest.approx(0.000001)
 
@@ -381,6 +400,8 @@ def test_t23_nullable_unavailable_token_metrics_are_handled_correctly(tmp_path: 
             completion_time_ns=300,
             success=True,
             input_tokens=128,
+            requested_input_tokens=128,
+            actual_prompt_tokens=128,
             requested_output_tokens=128,
             generated_tokens=None,
             ttft_s=0.0000001,
@@ -402,6 +423,43 @@ def test_t25_existing_cpu_smoke_test_still_passes_without_gpu_dependencies(tmp_p
     config.output_dir = tmp_path
     run_dir = run_experiment(config)
     assert validate_run(run_dir)["valid"]
+
+
+def test_w3_context_capacity_passes_with_4096_max_model_len(tmp_path: Path) -> None:
+    config = make_vllm_config(tmp_path)
+    config.workload = WorkloadConfig(id="W3")
+    config.backend.max_model_len = 4096
+    validate_context_capacity(config, generate_workload(config))
+
+
+def test_w3_context_capacity_fails_with_2048_max_model_len(tmp_path: Path) -> None:
+    config = make_vllm_config(tmp_path)
+    config.workload = WorkloadConfig(id="W3")
+    config.backend.max_model_len = 2048
+    with pytest.raises(ValueError) as exc_info:
+        validate_context_capacity(config, generate_workload(config))
+    message = str(exc_info.value)
+    assert "requested_input_tokens=2048" in message
+    assert "requested_output_tokens=128" in message
+    assert "required_context_length=2176" in message
+    assert "configured_max_model_len=2048" in message
+
+
+def test_context_capacity_boundary_equal_to_max_model_len_passes(tmp_path: Path) -> None:
+    config = make_vllm_config(tmp_path)
+    config.backend.max_model_len = 2176
+    trace = WorkloadTrace(
+        [
+            BenchmarkRequest(
+                request_id="req-boundary",
+                workload_id="W3",
+                input_tokens=2048,
+                requested_output_tokens=128,
+                scheduled_arrival_time_s=0.0,
+            )
+        ]
+    )
+    validate_context_capacity(config, trace)
 
 
 def test_two_physical_gpus_cuda_visible_zero_means_one_benchmark_visible() -> None:
@@ -480,3 +538,118 @@ def test_telemetry_selects_configured_gpu(monkeypatch: pytest.MonkeyPatch) -> No
     assert sample["gpu_index"] == 1
     assert sample["gpu_uuid"] == "GPU-1"
     assert sample["gpu_name"] == "Tesla T4"
+
+
+def test_exact_prompt_construction_is_deterministic() -> None:
+    first = construct_exact_prompt(FakeTokenizer(), 128)
+    second = construct_exact_prompt(FakeTokenizer(), 128)
+    assert first.text == second.text
+    assert first.actual_tokens == 128
+
+
+@pytest.mark.parametrize("token_count", [128, 512, 2048])
+def test_exact_prompt_construction_supports_canonical_lengths(token_count: int) -> None:
+    prompt = construct_exact_prompt(FakeTokenizer(), token_count)
+    assert prompt.requested_tokens == token_count
+    assert prompt.actual_tokens == token_count
+    assert len(FakeTokenizer().encode(prompt.text, add_special_tokens=False)) == token_count
+
+
+def test_vllm_prompt_uses_configured_tokenizer_and_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.backend as backend_module
+
+    calls = []
+
+    def fake_load_tokenizer(identifier, revision):
+        calls.append((identifier, revision))
+        return FakeTokenizer()
+
+    monkeypatch.setattr(backend_module, "load_tokenizer", fake_load_tokenizer)
+    config = make_vllm_config(tmp_path)
+    config.backend.tokenizer = "tokenizer/test"
+    config.backend.requested_model_revision = "abc123"
+    backend = VllmBackend(config.backend)
+    payload, actual_prompt_tokens = backend._payload(
+        BenchmarkRequest(
+            request_id="req",
+            workload_id="W1",
+            input_tokens=128,
+            requested_output_tokens=1,
+            scheduled_arrival_time_s=0.0,
+        )
+    )
+    assert calls == [("tokenizer/test", "abc123")]
+    assert actual_prompt_tokens == 128
+    assert payload["prompt"] == "a" * 128
+
+
+def test_requested_actual_prompt_token_mismatch_is_detected(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    raw_path = run_dir / RAW_RESULTS_FILENAME
+    row = json.loads(raw_path.read_text(encoding="utf-8").splitlines()[0])
+    row["actual_prompt_tokens"] = 127
+    raw_path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+    report = validate_run(run_dir)
+    assert "prompt_token_count_mismatch" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_provider_prompt_token_mismatch_is_detected(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    raw_path = run_dir / RAW_RESULTS_FILENAME
+    row = json.loads(raw_path.read_text(encoding="utf-8").splitlines()[0])
+    row["provider_prompt_tokens"] = 129
+    raw_path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+    report = validate_run(run_dir)
+    assert "provider_prompt_token_count_mismatch" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_explicit_model_revision_provenance_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.manifest as manifest_module
+
+    def fake_resolve(identifier, revision):
+        assert revision == "model-commit"
+        return f"resolved-{identifier}"
+
+    monkeypatch.setattr(manifest_module, "resolve_hf_snapshot_revision", fake_resolve)
+    config = make_vllm_config(tmp_path)
+    config.backend.requested_model_revision = "model-commit"
+    trace = generate_workload(config)
+    manifest = initial_manifest(config, trace, "run", tmp_path)
+    provenance = manifest["model_provenance"]
+    assert provenance["requested_model_revision"] == "model-commit"
+    assert provenance["resolved_model_revision_hash"] == "resolved-Qwen/Qwen3-4B-Instruct-2507"
+    assert provenance["tokenizer_identifier"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert provenance["tokenizer_resolved_revision_hash"] == "resolved-Qwen/Qwen3-4B-Instruct-2507"
+
+
+def test_scientific_validation_rejects_missing_model_revision(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    manifest_path = run_dir / MANIFEST_FILENAME
+    manifest = read_json(manifest_path)
+    manifest["validation_mode"] = "scientific"
+    manifest["canonical_configuration"]["validation_mode"] = "scientific"
+    manifest["model_provenance"]["resolved_model_revision_hash"] = None
+    manifest["config_hash"] = stable_hash(manifest["canonical_configuration"])
+    write_json(manifest_path, manifest)
+    report = validate_run(run_dir)
+    assert "unidentified_model_revision" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_strict_validation_rejects_missing_model_revision_in_smoke_run(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    report = validate_run(run_dir, strict_scientific=True)
+    assert "unidentified_model_revision" in issue_codes(report)
+    assert not report["valid"]
+
+
+def test_external_vllm_command_provenance_is_verbatim(tmp_path: Path) -> None:
+    run_dir = make_synthetic_vllm_run(tmp_path)
+    provenance = read_json(run_dir / MANIFEST_FILENAME)["model_provenance"]
+    assert provenance["serving_mode"] == "external"
+    assert provenance["serving_engine_command"] == (
+        "CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-4B-Instruct-2507 --host 127.0.0.1 --port 8000"
+    )
+    assert "entrypoints.openai.api_server" not in provenance["serving_engine_command"]

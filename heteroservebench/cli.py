@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser("validate", help="validate a run directory")
     validate_parser.add_argument("--run-dir", required=True, type=Path)
+    validate_parser.add_argument("--strict-scientific", action="store_true")
 
     summarize_parser = subparsers.add_parser("summarize", help="summarize a run directory")
     summarize_parser.add_argument("--run-dir", required=True, type=Path)
@@ -44,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(run_dir))
             return 0
         if args.command == "validate":
-            report = validate_run(args.run_dir)
+            report = validate_run(args.run_dir, strict_scientific=args.strict_scientific)
             print(json.dumps(report, indent=2, sort_keys=True))
             return 0 if report["valid"] else 2
         if args.command == "summarize":

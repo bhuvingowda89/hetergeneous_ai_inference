@@ -65,7 +65,7 @@ def _gpu_matches_identifier(gpu: dict, identifier: str) -> bool:
     return str(gpu.get("index")) == identifier or gpu.get("uuid") == identifier
 
 
-def validate_run(run_dir: Path) -> dict:
+def validate_run(run_dir: Path, *, strict_scientific: bool = False) -> dict:
     """Validate run artifacts and return a structured report."""
     issues: list[dict] = []
     manifest_path = run_dir / MANIFEST_FILENAME
@@ -123,8 +123,11 @@ def validate_run(run_dir: Path) -> dict:
     planned_ids = [request.request_id for request in planned]
     result_ids = [result.request_id for result in results]
     backend_type = None
+    validation_mode = manifest.get("validation_mode")
     if isinstance(canonical_config, dict) and isinstance(canonical_config.get("backend"), dict):
         backend_type = canonical_config["backend"].get("type")
+        validation_mode = canonical_config.get("validation_mode", validation_mode)
+    strict_revision = strict_scientific or validation_mode == "scientific"
 
     if len(planned_ids) != len(set(planned_ids)):
         issues.append(_issue("duplicate_planned_request_ids", "planned trace contains duplicate request IDs"))
@@ -187,6 +190,35 @@ def validate_run(run_dir: Path) -> dict:
             if backend_type == "vllm":
                 if result.input_tokens is None or result.requested_output_tokens is None:
                     issues.append(_issue("success_missing_token_counts", "GPU success record is missing configured token counts", context={"request_id": result.request_id}))
+                requested_input_tokens = result.requested_input_tokens
+                if requested_input_tokens is None:
+                    requested_input_tokens = result.input_tokens
+                if result.actual_prompt_tokens is None:
+                    issues.append(_issue("missing_actual_prompt_tokens", "GPU success record is missing actual prompt token count", context={"request_id": result.request_id}))
+                elif requested_input_tokens != result.actual_prompt_tokens:
+                    issues.append(
+                        _issue(
+                            "prompt_token_count_mismatch",
+                            "requested input tokens do not match actual tokenizer prompt tokens",
+                            context={
+                                "request_id": result.request_id,
+                                "requested_input_tokens": requested_input_tokens,
+                                "actual_prompt_tokens": result.actual_prompt_tokens,
+                            },
+                        )
+                    )
+                if result.provider_prompt_tokens is not None and result.actual_prompt_tokens != result.provider_prompt_tokens:
+                    issues.append(
+                        _issue(
+                            "provider_prompt_token_count_mismatch",
+                            "actual tokenizer prompt tokens do not match provider-reported prompt tokens",
+                            context={
+                                "request_id": result.request_id,
+                                "actual_prompt_tokens": result.actual_prompt_tokens,
+                                "provider_prompt_tokens": result.provider_prompt_tokens,
+                            },
+                        )
+                    )
                 if result.generated_tokens is None:
                     issues.append(_issue("generated_token_count_unavailable", "generated token count was not exposed by backend", severity="warning", context={"request_id": result.request_id}))
 
@@ -232,7 +264,8 @@ def validate_run(run_dir: Path) -> dict:
         if model.get("tensor_parallel_size") is None:
             issues.append(_issue("missing_tensor_parallel_size", "model provenance is missing tensor parallel size"))
         if model.get("resolved_model_revision_hash") is None:
-            issues.append(_issue("unidentified_model_revision", "resolved model revision/hash is unavailable", severity="warning"))
+            severity = "error" if strict_revision else "warning"
+            issues.append(_issue("unidentified_model_revision", "resolved model revision/hash is unavailable", severity=severity))
 
         if manifest.get("telemetry_enabled"):
             telemetry_rows = []

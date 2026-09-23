@@ -8,6 +8,12 @@ from abc import ABC, abstractmethod
 
 from heteroservebench.config import BackendConfig, SimulatedBackendConfig, VllmBackendConfig
 from heteroservebench.results import RequestResult
+from heteroservebench.tokenizer_prompt import (
+    PromptConstructionError,
+    construct_exact_prompt,
+    load_tokenizer,
+    tokenizer_identifier,
+)
 from heteroservebench.vllm_http import VllmHttpClient, http_error_type
 from heteroservebench.workload import BenchmarkRequest
 
@@ -56,6 +62,7 @@ class SimulatedBackend(Backend):
                 error_type="SimulatedBackendError",
                 error_message="configured simulated failure",
                 input_tokens=request.input_tokens,
+                requested_input_tokens=request.input_tokens,
                 requested_output_tokens=request.requested_output_tokens,
                 failure_classification="backend_error",
                 backend_metadata=self.metadata(),
@@ -75,6 +82,7 @@ class SimulatedBackend(Backend):
             completion_time_ns=completion_ns,
             success=True,
             input_tokens=request.input_tokens,
+            requested_input_tokens=request.input_tokens,
             requested_output_tokens=request.requested_output_tokens,
             generated_tokens=generated_tokens,
             ttft_s=None if self.config.ttft_ms is None else self.config.ttft_ms / 1000.0,
@@ -108,7 +116,26 @@ class VllmBackend(Backend):
 
     async def infer(self, request: BenchmarkRequest) -> RequestResult:
         start_ns = time.monotonic_ns()
-        payload = self._payload(request)
+        actual_prompt_tokens: int | None = None
+        try:
+            payload, actual_prompt_tokens = self._payload(request)
+        except PromptConstructionError as exc:
+            return RequestResult(
+                request_id=request.request_id,
+                workload_id=request.workload_id,
+                scheduled_arrival_time_s=request.scheduled_arrival_time_s,
+                backend_start_time_ns=start_ns,
+                completion_time_ns=time.monotonic_ns(),
+                success=False,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                input_tokens=request.input_tokens,
+                requested_input_tokens=request.input_tokens,
+                actual_prompt_tokens=actual_prompt_tokens,
+                requested_output_tokens=request.requested_output_tokens,
+                failure_classification="backend_error",
+                backend_metadata=self.metadata(),
+            )
         try:
             parsed = await asyncio.to_thread(self.client.stream_completion, payload)
         except Exception as exc:
@@ -122,6 +149,8 @@ class VllmBackend(Backend):
                 error_type=http_error_type(exc),
                 error_message=str(exc),
                 input_tokens=request.input_tokens,
+                requested_input_tokens=request.input_tokens,
+                actual_prompt_tokens=actual_prompt_tokens,
                 requested_output_tokens=request.requested_output_tokens,
                 failure_classification="backend_error",
                 backend_metadata=self.metadata(),
@@ -137,6 +166,9 @@ class VllmBackend(Backend):
             completion_time_ns=completion_ns,
             success=True,
             input_tokens=request.input_tokens,
+            requested_input_tokens=request.input_tokens,
+            actual_prompt_tokens=actual_prompt_tokens,
+            provider_prompt_tokens=parsed.provider_prompt_tokens,
             requested_output_tokens=request.requested_output_tokens,
             generated_tokens=parsed.generated_tokens,
             token_event_time_ns=parsed.token_event_time_ns,
@@ -146,11 +178,11 @@ class VllmBackend(Backend):
             backend_metadata=self.metadata(),
         )
 
-    def _payload(self, request: BenchmarkRequest) -> dict:
+    def _payload(self, request: BenchmarkRequest) -> tuple[dict, int]:
         prompt = self._prompt(request)
         payload = {
             "model": self.config.model,
-            "prompt": prompt,
+            "prompt": prompt.text,
             "max_tokens": min(self.config.max_tokens, request.requested_output_tokens),
             "temperature": self.config.temperature,
             "stream": self.config.stream,
@@ -159,12 +191,12 @@ class VllmBackend(Backend):
         if self.config.seed is not None:
             payload["seed"] = self.config.seed
         payload.update(self.config.extra_body)
-        return payload
+        return payload, prompt.actual_tokens
 
-    @staticmethod
-    def _prompt(request: BenchmarkRequest) -> str:
-        words = max(1, request.input_tokens // 4)
-        return "Benchmark request. " + " ".join(["token"] * words)
+    def _prompt(self, request: BenchmarkRequest):
+        identifier = tokenizer_identifier(self.config.model, self.config.tokenizer)
+        tokenizer = load_tokenizer(identifier, self.config.requested_model_revision)
+        return construct_exact_prompt(tokenizer, request.input_tokens)
 
     def metadata(self) -> dict:
         return {
@@ -179,6 +211,7 @@ class VllmBackend(Backend):
             "tensor_parallel_size": self.config.tensor_parallel_size,
             "max_model_len": self.config.max_model_len,
             "serving_engine": "vllm",
+            "serving_mode": self.config.serving_mode,
             "serving_engine_command": self.config.serving_engine_command,
             "streaming": self.config.stream,
         }

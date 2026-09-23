@@ -54,24 +54,29 @@ python -m heteroservebench summarize --run-dir runs/<run_id>
 
 Summaries include only basic derived metrics: counts, throughput, latency percentiles, mean latency, and SLO attainment when configured. Analysis code refuses to overwrite existing summary files and never rewrites raw results.
 
-## Phase 3A GPU Smoke
+## Phase 3C GPU Smoke And Reproducibility
 
 GPU/vLLM support is optional and uses vLLM's OpenAI-compatible HTTP server. The base package still runs CPU tests without CUDA, PyTorch, or vLLM.
 
 ```bash
 pip install -e ".[gpu]"
-CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen3-4B-Instruct-2507 \
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-4B-Instruct-2507 \
   --served-model-name Qwen/Qwen3-4B-Instruct-2507 \
+  --revision cdbee75f17c01a7cc42f958dc650907174af0554 \
+  --tokenizer-revision cdbee75f17c01a7cc42f958dc650907174af0554 \
   --tensor-parallel-size 1 \
   --dtype float16 \
-  --max-model-len 2048 \
-  --host 0.0.0.0 \
+  --max-model-len 4096 \
+  --host 127.0.0.1 \
   --port 8000
 python -m heteroservebench run --config configs/gpu/t4_qwen3_4b_smoke.yaml
 ```
 
-See `docs/KAGGLE_T4.md` for the full single-T4 Kaggle procedure. Phase 3A is device validation only, not scientific benchmarking.
+Phase 3C pins the GPU extra to the verified serving engine `vLLM 0.27.1`. On Tesla T4, vLLM falls back to TRITON_ATTN because FlashAttention-2 is unavailable on compute capability 7.5. Use `CUDA_VISIBLE_DEVICES=0` to isolate one benchmark-visible GPU even when Kaggle exposes two physical T4s.
+
+Scientific GPU runs require exact tokenizer-level prompts. Each request records `requested_input_tokens`, `actual_prompt_tokens`, and, when vLLM reports it, `provider_prompt_tokens`; validation fails if these disagree. Scientific runs must also pin a real Hugging Face model revision and resolve a snapshot hash in the manifest. Smoke/exploratory runs may leave the revision unresolved, but validation reports a warning.
+
+See `docs/KAGGLE_T4.md` for the full single-T4 Kaggle procedure. Smoke runs validate infrastructure only, not scientific benchmarking.
 
 ## Repository Organization
 

@@ -23,6 +23,9 @@ class RequestResult(BaseModel):
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     input_tokens: int = Field(ge=0)
+    requested_input_tokens: Optional[int] = Field(default=None, ge=0)
+    actual_prompt_tokens: Optional[int] = Field(default=None, ge=0)
+    provider_prompt_tokens: Optional[int] = Field(default=None, ge=0)
     requested_output_tokens: int = Field(ge=0)
     generated_tokens: Optional[int] = Field(default=None, ge=0)
     token_event_time_ns: list[int] = Field(default_factory=list)

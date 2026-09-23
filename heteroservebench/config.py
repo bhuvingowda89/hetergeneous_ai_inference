@@ -107,6 +107,7 @@ class VllmBackendConfig(StrictModel):
     expected_gpu_count: Optional[int] = Field(default=None, ge=1)
     expected_gpu_name: Optional[str] = None
     expected_gpu_uuid: Optional[str] = None
+    serving_mode: Literal["external"] = "external"
     serving_engine_command: Optional[str] = None
     extra_body: dict = Field(default_factory=dict)
 
@@ -116,6 +117,7 @@ BackendConfig = Union[SimulatedBackendConfig, VllmBackendConfig]
 
 class ExperimentConfig(StrictModel):
     schema_version: str = "1.0"
+    validation_mode: Literal["smoke", "scientific"] = "smoke"
     campaign_id: str = Field(min_length=1)
     experiment_id: str = Field(min_length=1)
     seed: SeedConfig

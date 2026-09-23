@@ -50,6 +50,7 @@ async def _execute_one(
             error_type=type(exc).__name__,
             error_message=str(exc),
             input_tokens=request.input_tokens,
+            requested_input_tokens=request.input_tokens,
             requested_output_tokens=request.requested_output_tokens,
             failure_classification="backend_error",
             backend_metadata=backend.metadata(),
@@ -107,6 +108,25 @@ def make_warmup_trace(trace: WorkloadTrace, count: int) -> WorkloadTrace:
         for index in range(count)
     ]
     return WorkloadTrace(requests)
+
+
+def validate_context_capacity(config: ExperimentConfig, trace: WorkloadTrace) -> None:
+    """Reject vLLM requests that cannot fit within configured model context."""
+    if config.backend.type != "vllm":
+        return
+    max_model_len = config.backend.max_model_len
+    for request in trace.requests:
+        required_context_length = request.input_tokens + request.requested_output_tokens
+        if required_context_length > max_model_len:
+            raise ValueError(
+                "request context length exceeds configured max_model_len: "
+                f"request_id={request.request_id}, "
+                f"workload_id={request.workload_id}, "
+                f"requested_input_tokens={request.input_tokens}, "
+                f"requested_output_tokens={request.requested_output_tokens}, "
+                f"required_context_length={required_context_length}, "
+                f"configured_max_model_len={max_model_len}"
+            )
 
 
 async def _run_with_optional_telemetry(
@@ -170,6 +190,7 @@ async def _execute_run(
 def run_experiment(config: ExperimentConfig) -> Path:
     """Execute an experiment and return its run directory."""
     trace = generate_workload(config)
+    validate_context_capacity(config, trace)
     run_id = new_run_id(config.campaign_id)
     run_dir = create_run_dir(config.output_dir, run_id)
     raw_path = run_dir / RAW_RESULTS_FILENAME

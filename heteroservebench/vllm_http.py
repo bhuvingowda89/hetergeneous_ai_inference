@@ -19,6 +19,7 @@ class StreamingParseResult:
     token_event_time_ns: list[int] = field(default_factory=list)
     text_chunks: list[str] = field(default_factory=list)
     generated_tokens: Optional[int] = None
+    provider_prompt_tokens: Optional[int] = None
     raw_usage: Optional[dict] = None
 
     @property
@@ -63,6 +64,9 @@ def observe_stream_event(result: StreamingParseResult, event: dict, timestamp_ns
         completion_tokens = usage.get("completion_tokens")
         if isinstance(completion_tokens, int):
             result.generated_tokens = completion_tokens
+        prompt_tokens = usage.get("prompt_tokens")
+        if isinstance(prompt_tokens, int):
+            result.provider_prompt_tokens = prompt_tokens
 
     choices = event.get("choices") or []
     for choice in choices:
