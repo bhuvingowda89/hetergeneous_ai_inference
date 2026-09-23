@@ -631,7 +631,9 @@ def test_scientific_validation_rejects_missing_model_revision(tmp_path: Path) ->
     manifest["validation_mode"] = "scientific"
     manifest["canonical_configuration"]["validation_mode"] = "scientific"
     manifest["model_provenance"]["resolved_model_revision_hash"] = None
+    manifest["model_provenance"]["tokenizer_resolved_revision_hash"] = None
     manifest["config_hash"] = stable_hash(manifest["canonical_configuration"])
+    manifest["manifest_hash"] = manifest_hash(manifest)
     write_json(manifest_path, manifest)
     report = validate_run(run_dir)
     assert "unidentified_model_revision" in issue_codes(report)
@@ -640,6 +642,12 @@ def test_scientific_validation_rejects_missing_model_revision(tmp_path: Path) ->
 
 def test_strict_validation_rejects_missing_model_revision_in_smoke_run(tmp_path: Path) -> None:
     run_dir = make_synthetic_vllm_run(tmp_path)
+    manifest_path = run_dir / MANIFEST_FILENAME
+    manifest = read_json(manifest_path)
+    manifest["model_provenance"]["resolved_model_revision_hash"] = None
+    manifest["model_provenance"]["tokenizer_resolved_revision_hash"] = None
+    manifest["manifest_hash"] = manifest_hash(manifest)
+    write_json(manifest_path, manifest)
     report = validate_run(run_dir, strict_scientific=True)
     assert "unidentified_model_revision" in issue_codes(report)
     assert not report["valid"]
