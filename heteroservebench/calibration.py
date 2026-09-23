@@ -50,9 +50,13 @@ class ProbeOutcome:
 class SearchResult:
     highest_sustainable_rps: Optional[float]
     first_non_sustainable_rps: Optional[float]
+    final_non_sustainable_bound_rps: Optional[float]
     capacity_rps: Optional[float]
     capacity_is_lower_bound: bool
     calibration_failed: bool
+    search_incomplete: bool
+    termination_reason: str
+    bracket_converged: bool
     probes: list[ProbeOutcome]
 
 
@@ -105,6 +109,7 @@ def adaptive_search(
     if is_sustainable_probe(first):
         low = rate
         high: Optional[float] = None
+        first_high: Optional[float] = None
         while len(probes) < max_open_loop_probes and low < maximum_rps:
             candidate = min(low * 2.0, maximum_rps)
             if candidate == low:
@@ -116,11 +121,25 @@ def adaptive_search(
                     break
             else:
                 high = candidate
+                first_high = candidate
                 break
         if high is None:
-            return SearchResult(low, None, low, True, False, probes)
+            lower_bound = low >= maximum_rps
+            return SearchResult(
+                low,
+                None,
+                None,
+                low,
+                lower_bound,
+                False,
+                not lower_bound,
+                "max_rate_sustainable" if lower_bound else "probe_cap_without_bracket",
+                False,
+                probes,
+            )
     else:
         high = rate
+        first_high = rate
         low = None
         while len(probes) < max_open_loop_probes and high > minimum_rps:
             candidate = max(high / 2.0, minimum_rps)
@@ -132,7 +151,18 @@ def adaptive_search(
                 break
             high = candidate
         if low is None:
-            return SearchResult(None, high, None, False, True, probes)
+            return SearchResult(
+                None,
+                first_high,
+                high,
+                None,
+                False,
+                True,
+                False,
+                "minimum_rate_unsustainable",
+                False,
+                probes,
+            )
 
     assert low is not None
     assert high is not None
@@ -145,7 +175,14 @@ def adaptive_search(
             low = midpoint
         else:
             high = midpoint
-    return SearchResult(low, high, low, False, False, probes)
+    bracket_converged = high / low <= bracket_ratio_stop
+    if bracket_converged:
+        termination_reason = "bracket_converged"
+    elif refinements >= max_refinement_probes:
+        termination_reason = "refinement_limit"
+    else:
+        termination_reason = "probe_cap_with_bracket"
+    return SearchResult(low, first_high, high, low, False, False, False, termination_reason, bracket_converged, probes)
 
 
 def derived_probe_config(
@@ -247,11 +284,25 @@ def probe_record(
     successes = [result for result in results if result.success]
     starts = [result.actual_dispatch_time_ns for result in results if result.actual_dispatch_time_ns is not None]
     ends = [result.completion_time_ns for result in results if result.completion_time_ns is not None]
-    duration_s = None
+    drain_inclusive_duration_s = None
     if starts and ends and max(ends) >= min(starts):
-        duration_s = (max(ends) - min(starts)) / 1_000_000_000
-    achieved = None if not duration_s or duration_s <= 0 else len(successes) / duration_s
+        drain_inclusive_duration_s = (max(ends) - min(starts)) / 1_000_000_000
+    drain_inclusive_throughput = (
+        None
+        if not drain_inclusive_duration_s or drain_inclusive_duration_s <= 0
+        else len(successes) / drain_inclusive_duration_s
+    )
+    success_completion_times = sorted(
+        result.completion_time_ns for result in successes if result.completion_time_ns is not None
+    )
+    completion_span_s = None
+    achieved = None
+    if len(success_completion_times) >= 2:
+        completion_span_s = (success_completion_times[-1] - success_completion_times[0]) / 1_000_000_000
+        if completion_span_s > 0:
+            achieved = (len(success_completion_times) - 1) / completion_span_s
     throughput_ratio = None if achieved is None else achieved / offered_rps
+    drain_inclusive_ratio = None if drain_inclusive_throughput is None else drain_inclusive_throughput / offered_rps
     latencies = [result.end_to_end_latency_s for result in successes if result.end_to_end_latency_s is not None]
     ttfts = [result.ttft_s for result in successes if result.ttft_s is not None]
     services = [result.service_latency_s for result in successes if result.service_latency_s is not None]
@@ -277,6 +328,11 @@ def probe_record(
         "success_rate": None if not results else len(successes) / len(results),
         "achieved_throughput_rps": achieved,
         "throughput_ratio": throughput_ratio,
+        "throughput_measurement_method": "completion_span",
+        "completion_span_s": completion_span_s,
+        "drain_inclusive_duration_s": drain_inclusive_duration_s,
+        "drain_inclusive_throughput_rps": drain_inclusive_throughput,
+        "drain_inclusive_throughput_ratio": drain_inclusive_ratio,
         "e2e_latency_mean_s": _mean(latencies),
         "e2e_latency_p50_s": _percentile(latencies, 50),
         "e2e_latency_p95_s": _percentile(latencies, 95),
@@ -286,7 +342,11 @@ def probe_record(
         "ttft_p95_s": _percentile(ttfts, 95),
         "service_latency_mean_s": _mean(services),
         "service_latency_p95_s": _percentile(services, 95),
-        "queue_latency_p95_s": _percentile(queues, 95),
+        "client_dispatch_delay_p95_s": _percentile(queues, 95),
+        "client_dispatch_delay_semantics": (
+            "Time from load-generator dispatch timestamp to backend.infer entry; "
+            "not vLLM scheduler queue time."
+        ),
         "requested_input_tokens": None if first_success is None else first_success.requested_input_tokens,
         "actual_prompt_tokens": None if first_success is None else first_success.actual_prompt_tokens,
         "provider_prompt_tokens": None if first_success is None else first_success.provider_prompt_tokens,
@@ -323,15 +383,41 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def validate_baseline_record(record: dict) -> None:
+    if not record.get("strict_validation_valid"):
+        raise RuntimeError(f"baseline strict validation failed for {record.get('workload_id')}: {record.get('validation_issues')}")
+    if record.get("measured_request_count") != BASELINE_MEASURED_REQUESTS:
+        raise RuntimeError(f"baseline measured request count is not 1: {record.get('measured_request_count')}")
+    if record.get("success_count") != 1:
+        raise RuntimeError(f"baseline success count is not 1: {record.get('success_count')}")
+    if record.get("failure_count") != 0:
+        raise RuntimeError(f"baseline failure count is not 0: {record.get('failure_count')}")
+    service_latency = record.get("service_latency_mean_s")
+    if service_latency is None or service_latency <= 0:
+        raise RuntimeError(f"baseline service latency must be positive: {service_latency}")
+
+
 def write_summary_csv(path: Path, summaries: list[dict]) -> None:
     fieldnames = [
         "workload_id",
         "unloaded_median_service_latency_s",
-        "unloaded_median_ttFT_s",
+        "unloaded_median_ttft_s",
         "highest_sustainable_offered_rps",
         "first_non_sustainable_offered_rps",
+        "final_non_sustainable_bound_rps",
         "estimated_capacity_rps",
         "capacity_is_lower_bound",
+        "termination_reason",
+        "search_incomplete",
+        "baseline_run_count",
+        "open_loop_probe_count",
+        "total_run_count",
         "number_of_probes",
         "run_directories",
     ]
@@ -377,6 +463,8 @@ def run_calibration(
     output_root: Path = Path("calibration_runs"),
     cooldown_s: float = DEFAULT_COOLDOWN_S,
 ) -> Path:
+    if cooldown_s < 0:
+        raise ValueError(f"cooldown_s must be non-negative: {cooldown_s}")
     base_config = base_config.model_copy(deep=True)
     base_config.validation_mode = "scientific"
     check_scientific_calibration_config(base_config, workload_ids)
@@ -385,109 +473,135 @@ def run_calibration(
     calibration_dir.mkdir(parents=True, exist_ok=False)
     all_records: list[dict] = []
     summaries: list[dict] = []
+    probes_path = calibration_dir / "calibration_probes.jsonl"
+    manifest_path = calibration_dir / "calibration_manifest.json"
     manifest = {
         "calibration_id": calibration_id,
+        "status": "running",
         "start_time": utc_now_iso(),
+        "end_time": None,
+        "terminal_error": None,
         "base_config": base_config.canonical(),
         "workloads": workload_ids,
         "git_commit_sha": git_commit_sha(Path.cwd()),
         "package_metadata": package_metadata(),
+        "server_queue_latency_collected": False,
+        "server_queue_latency_note": (
+            "Primary calibration intentionally does not enable vLLM per-request timing "
+            "instrumentation because instrumentation could perturb capacity measurements."
+        ),
     }
-    write_json(calibration_dir / "calibration_manifest.json", manifest)
+    write_json(manifest_path, manifest)
 
-    for workload_id in workload_ids:
-        baseline_records = []
-        baseline_services = []
-        baseline_ttfts = []
-        baseline_e2e = []
-        workload_output = calibration_dir / workload_id.lower()
-        for index in range(BASELINE_REPETITIONS):
-            check_server_health(base_config.backend.base_url, base_config.backend.request_timeout_s)
-            config = derived_probe_config(
-                base_config,
-                workload_id,
-                offered_rps=MIN_PROBE_RPS,
-                measured_requests=BASELINE_MEASURED_REQUESTS,
-                warmup_requests=0,
-                output_dir=workload_output / "baseline",
-                experiment_suffix=f"baseline-{index}",
+    try:
+        for workload_id in workload_ids:
+            baseline_records = []
+            baseline_services = []
+            baseline_ttfts = []
+            baseline_e2e = []
+            workload_output = calibration_dir / workload_id.lower()
+            for index in range(BASELINE_REPETITIONS):
+                check_server_health(base_config.backend.base_url, base_config.backend.request_timeout_s)
+                config = derived_probe_config(
+                    base_config,
+                    workload_id,
+                    offered_rps=MIN_PROBE_RPS,
+                    measured_requests=BASELINE_MEASURED_REQUESTS,
+                    warmup_requests=0,
+                    output_dir=workload_output / "baseline",
+                    experiment_suffix=f"baseline-{index}",
+                )
+                validate_context_capacity(config, generate_workload(config))
+                run_dir = run_experiment(config)
+                report = validate_run(run_dir, strict_scientific=True)
+                record = probe_record(
+                    workload_id=workload_id,
+                    probe_type="baseline",
+                    run_dir=run_dir,
+                    offered_rps=MIN_PROBE_RPS,
+                    measured_request_count=BASELINE_MEASURED_REQUESTS,
+                    validation_report=report,
+                )
+                baseline_records.append(record)
+                all_records.append(record)
+                append_jsonl(probes_path, record)
+                validate_baseline_record(record)
+                baseline_services.append(record["service_latency_mean_s"])
+                baseline_ttfts.extend([value for value in [record["ttft_mean_s"]] if value is not None])
+                baseline_e2e.extend([value for value in [record["e2e_latency_mean_s"]] if value is not None])
+                if cooldown_s:
+                    time.sleep(cooldown_s)
+            l0 = median(baseline_services)
+            initial_rate = initial_offered_rps(l0)
+
+            probe_records_by_rate: dict[float, dict] = {}
+
+            def execute_probe(rate: float, probe_type: str) -> ProbeOutcome:
+                check_server_health(base_config.backend.base_url, base_config.backend.request_timeout_s)
+                config = derived_probe_config(
+                    base_config,
+                    workload_id,
+                    offered_rps=rate,
+                    measured_requests=PROBE_MEASURED_REQUESTS,
+                    warmup_requests=PROBE_WARMUP_REQUESTS,
+                    output_dir=workload_output / "probes",
+                    experiment_suffix=probe_type,
+                )
+                validate_context_capacity(config, generate_workload(config))
+                run_dir = run_experiment(config)
+                report = validate_run(run_dir, strict_scientific=True)
+                record = probe_record(
+                    workload_id=workload_id,
+                    probe_type=probe_type,
+                    run_dir=run_dir,
+                    offered_rps=rate,
+                    measured_request_count=PROBE_MEASURED_REQUESTS,
+                    validation_report=report,
+                )
+                probe_records_by_rate[rate] = record
+                all_records.append(record)
+                append_jsonl(probes_path, record)
+                if cooldown_s:
+                    time.sleep(cooldown_s)
+                return outcome_from_record(record)
+
+            search = adaptive_search(initial_rate, execute_probe)
+            if search.calibration_failed:
+                raise RuntimeError(f"no sustainable calibration point found for {workload_id} at minimum rate")
+            open_loop_probe_count = len(search.probes)
+            total_run_count = BASELINE_REPETITIONS + open_loop_probe_count
+            summaries.append(
+                {
+                    "workload_id": workload_id,
+                    "unloaded_median_service_latency_s": l0,
+                    "unloaded_median_ttft_s": None if not baseline_ttfts else median(baseline_ttfts),
+                    "unloaded_median_e2e_latency_s": None if not baseline_e2e else median(baseline_e2e),
+                    "highest_sustainable_offered_rps": search.highest_sustainable_rps,
+                    "first_non_sustainable_offered_rps": search.first_non_sustainable_rps,
+                    "final_non_sustainable_bound_rps": search.final_non_sustainable_bound_rps,
+                    "estimated_capacity_rps": search.capacity_rps,
+                    "capacity_is_lower_bound": search.capacity_is_lower_bound,
+                    "termination_reason": search.termination_reason,
+                    "search_incomplete": search.search_incomplete,
+                    "baseline_run_count": BASELINE_REPETITIONS,
+                    "open_loop_probe_count": open_loop_probe_count,
+                    "total_run_count": total_run_count,
+                    "number_of_probes": open_loop_probe_count,
+                    "run_directories": [record["run_dir"] for record in baseline_records + list(probe_records_by_rate.values())],
+                }
             )
-            validate_context_capacity(config, generate_workload(config))
-            run_dir = run_experiment(config)
-            report = validate_run(run_dir, strict_scientific=True)
-            record = probe_record(
-                workload_id=workload_id,
-                probe_type="baseline",
-                run_dir=run_dir,
-                offered_rps=MIN_PROBE_RPS,
-                measured_request_count=BASELINE_MEASURED_REQUESTS,
-                validation_report=report,
-            )
-            baseline_records.append(record)
-            all_records.append(record)
-            if not report.get("valid"):
-                raise RuntimeError(f"baseline strict validation failed for {workload_id}: {report}")
-            baseline_services.extend([value for value in [record["service_latency_mean_s"]] if value is not None])
-            baseline_ttfts.extend([value for value in [record["ttft_mean_s"]] if value is not None])
-            baseline_e2e.extend([value for value in [record["e2e_latency_mean_s"]] if value is not None])
-            if cooldown_s:
-                time.sleep(cooldown_s)
-        l0 = median(baseline_services)
-        initial_rate = initial_offered_rps(l0)
 
-        probe_records_by_rate: dict[float, dict] = {}
-
-        def execute_probe(rate: float, probe_type: str) -> ProbeOutcome:
-            check_server_health(base_config.backend.base_url, base_config.backend.request_timeout_s)
-            config = derived_probe_config(
-                base_config,
-                workload_id,
-                offered_rps=rate,
-                measured_requests=PROBE_MEASURED_REQUESTS,
-                warmup_requests=PROBE_WARMUP_REQUESTS,
-                output_dir=workload_output / "probes",
-                experiment_suffix=probe_type,
-            )
-            validate_context_capacity(config, generate_workload(config))
-            run_dir = run_experiment(config)
-            report = validate_run(run_dir, strict_scientific=True)
-            record = probe_record(
-                workload_id=workload_id,
-                probe_type=probe_type,
-                run_dir=run_dir,
-                offered_rps=rate,
-                measured_request_count=PROBE_MEASURED_REQUESTS,
-                validation_report=report,
-            )
-            probe_records_by_rate[rate] = record
-            all_records.append(record)
-            if cooldown_s:
-                time.sleep(cooldown_s)
-            return outcome_from_record(record)
-
-        search = adaptive_search(initial_rate, execute_probe)
-        if search.calibration_failed:
-            raise RuntimeError(f"no sustainable calibration point found for {workload_id} at minimum rate")
-        summaries.append(
-            {
-                "workload_id": workload_id,
-                "unloaded_median_service_latency_s": l0,
-                "unloaded_median_ttFT_s": None if not baseline_ttfts else median(baseline_ttfts),
-                "unloaded_median_e2e_latency_s": None if not baseline_e2e else median(baseline_e2e),
-                "highest_sustainable_offered_rps": search.highest_sustainable_rps,
-                "first_non_sustainable_offered_rps": search.first_non_sustainable_rps,
-                "estimated_capacity_rps": search.capacity_rps,
-                "capacity_is_lower_bound": search.capacity_is_lower_bound,
-                "number_of_probes": len(search.probes),
-                "run_directories": [record["run_dir"] for record in baseline_records + list(probe_records_by_rate.values())],
-            }
-        )
-
-    write_jsonl(calibration_dir / "calibration_probes.jsonl", all_records)
-    write_json(calibration_dir / "calibration_summary.json", summaries)
-    write_summary_csv(calibration_dir / "calibration_summary.csv", summaries)
-    manifest["end_time"] = utc_now_iso()
-    write_json(calibration_dir / "calibration_manifest.json", manifest)
+        write_json(calibration_dir / "calibration_summary.json", summaries)
+        write_summary_csv(calibration_dir / "calibration_summary.csv", summaries)
+        manifest["status"] = "completed"
+        manifest["end_time"] = utc_now_iso()
+        write_json(manifest_path, manifest)
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["end_time"] = utc_now_iso()
+        manifest["terminal_error"] = {"type": type(exc).__name__, "message": str(exc)}
+        write_json(manifest_path, manifest)
+        raise
     return calibration_dir
 
 
@@ -499,4 +613,6 @@ def parse_workload_ids(text: str) -> list[str]:
         raise ValueError(f"unknown workload IDs: {', '.join(invalid)}")
     if not workload_ids:
         raise ValueError("at least one workload is required")
+    if len(workload_ids) != len(set(workload_ids)):
+        raise ValueError("duplicate workload IDs are not allowed")
     return workload_ids

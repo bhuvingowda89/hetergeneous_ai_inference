@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,10 @@ from heteroservebench.calibration import (
     initial_offered_rps,
     interval_ms_for_rate,
     is_sustainable_probe,
+    parse_workload_ids,
+    probe_record,
+    run_calibration,
+    validate_baseline_record,
 )
 from heteroservebench.cli import main
 from heteroservebench.config import (
@@ -150,6 +155,50 @@ def make_synthetic_vllm_run(tmp_path: Path, *, gpu_identity: bool = True, ttft_s
 
 def issue_codes(report: dict) -> set[str]:
     return {issue["code"] for issue in report["issues"]}
+
+
+def make_probe_run_dir(tmp_path: Path, completion_times_s: list[float], *, failures: int = 0) -> Path:
+    run_dir = tmp_path / f"probe-{len(list(tmp_path.iterdir()))}"
+    run_dir.mkdir()
+    write_json(
+        run_dir / MANIFEST_FILENAME,
+        {
+            "run_id": run_dir.name,
+            "git_commit_sha": "commit",
+            "model_provenance": {
+                "model_id": "model",
+                "resolved_model_revision_hash": "revision",
+                "serving_engine_version": "0.test",
+            },
+            "hardware_profile": {"gpu_name": "Tesla T4", "gpu_uuid": "GPU-test"},
+        },
+    )
+    raw_path = run_dir / RAW_RESULTS_FILENAME
+    interval_ns = 500_000_000
+    for index, completion_s in enumerate(completion_times_s):
+        completion_ns = int(completion_s * 1_000_000_000)
+        dispatch_ns = index * interval_ns
+        result = RequestResult(
+            request_id=f"req-{index:08d}",
+            workload_id="W1",
+            scheduled_arrival_time_s=index * 0.5,
+            actual_dispatch_time_ns=dispatch_ns,
+            backend_start_time_ns=dispatch_ns,
+            first_token_time_ns=dispatch_ns + 10_000_000,
+            completion_time_ns=completion_ns,
+            success=index >= failures,
+            input_tokens=128,
+            requested_input_tokens=128,
+            actual_prompt_tokens=128,
+            provider_prompt_tokens=128,
+            requested_output_tokens=128,
+            generated_tokens=128,
+            ttft_s=0.01,
+            service_latency_s=(completion_ns - dispatch_ns) / 1_000_000_000,
+            end_to_end_latency_s=(completion_ns - dispatch_ns) / 1_000_000_000,
+        )
+        append_raw_result(raw_path, result)
+    return run_dir
 
 
 class FakeTokenizer:
@@ -834,6 +883,68 @@ def test_strict_validation_rejection() -> None:
     assert not is_sustainable_probe(outcome(1.0, validation_valid=False))
 
 
+def test_completion_span_throughput_corrects_finite_window_bias(tmp_path: Path) -> None:
+    run_dir = make_probe_run_dir(tmp_path, [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5])
+    record = probe_record(
+        workload_id="W1",
+        probe_type="expansion",
+        run_dir=run_dir,
+        offered_rps=2.0,
+        measured_request_count=8,
+        validation_report={"valid": True, "issues": []},
+    )
+    assert record["completion_span_s"] == pytest.approx(3.5)
+    assert record["achieved_throughput_rps"] == pytest.approx(2.0)
+    assert record["throughput_ratio"] == pytest.approx(1.0)
+    assert record["throughput_measurement_method"] == "completion_span"
+    assert record["drain_inclusive_duration_s"] == pytest.approx(4.5)
+    assert record["drain_inclusive_throughput_rps"] == pytest.approx(8 / 4.5)
+    assert record["drain_inclusive_throughput_ratio"] == pytest.approx((8 / 4.5) / 2.0)
+    assert is_sustainable_probe(outcome_from_record_like(record))
+
+
+def outcome_from_record_like(record: dict) -> ProbeOutcome:
+    return ProbeOutcome(
+        offered_rps=record["offered_rps"],
+        strict_validation_valid=record["strict_validation_valid"],
+        success_count=record["success_count"],
+        failure_count=record["failure_count"],
+        measured_request_count=record["measured_request_count"],
+        achieved_throughput_rps=record["achieved_throughput_rps"],
+        throughput_ratio=record["throughput_ratio"],
+    )
+
+
+def test_overloaded_completion_span_throughput_rejects_probe(tmp_path: Path) -> None:
+    run_dir = make_probe_run_dir(tmp_path, [1.0, 1.6, 2.2, 2.8, 3.4, 4.0, 4.6, 5.2])
+    record = probe_record(
+        workload_id="W1",
+        probe_type="expansion",
+        run_dir=run_dir,
+        offered_rps=2.0,
+        measured_request_count=8,
+        validation_report={"valid": True, "issues": []},
+    )
+    assert record["achieved_throughput_rps"] == pytest.approx(7 / 4.2)
+    assert record["throughput_ratio"] < 0.95
+    assert not is_sustainable_probe(outcome_from_record_like(record))
+
+
+def test_drain_inclusive_metric_does_not_control_sustainability(tmp_path: Path) -> None:
+    run_dir = make_probe_run_dir(tmp_path, [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5])
+    record = probe_record(
+        workload_id="W1",
+        probe_type="expansion",
+        run_dir=run_dir,
+        offered_rps=2.0,
+        measured_request_count=8,
+        validation_report={"valid": True, "issues": []},
+    )
+    assert record["drain_inclusive_throughput_ratio"] < 0.95
+    assert record["throughput_ratio"] == pytest.approx(1.0)
+    assert is_sustainable_probe(outcome_from_record_like(record))
+
+
 def test_adaptive_search_rate_doubling() -> None:
     rates = []
 
@@ -845,6 +956,7 @@ def test_adaptive_search_rate_doubling() -> None:
     assert rates[:3] == [1.0, 2.0, 4.0]
     assert result.highest_sustainable_rps == 2.0
     assert result.first_non_sustainable_rps == 4.0
+    assert result.final_non_sustainable_bound_rps == 4.0
 
 
 def test_adaptive_search_rate_halving() -> None:
@@ -857,7 +969,8 @@ def test_adaptive_search_rate_halving() -> None:
     result = adaptive_search(4.0, probe, max_refinement_probes=0)
     assert rates[:3] == [4.0, 2.0, 1.0]
     assert result.highest_sustainable_rps == 1.0
-    assert result.first_non_sustainable_rps == 2.0
+    assert result.first_non_sustainable_rps == 4.0
+    assert result.final_non_sustainable_bound_rps == 2.0
 
 
 def test_geometric_midpoint_refinement() -> None:
@@ -871,6 +984,16 @@ def test_geometric_midpoint_refinement() -> None:
     assert rates == [1.0, 2.0, 4.0, pytest.approx(2.8284271247461903)]
 
 
+def test_first_non_sustainable_is_preserved_while_final_bound_refines() -> None:
+    def probe(rate: float, probe_type: str) -> ProbeOutcome:
+        return outcome(rate, sustainable=rate < 1.2)
+
+    result = adaptive_search(1.0, probe, max_refinement_probes=1)
+    assert result.first_non_sustainable_rps == 2.0
+    assert result.final_non_sustainable_bound_rps == pytest.approx(math.sqrt(2.0))
+    assert result.final_non_sustainable_bound_rps != result.first_non_sustainable_rps
+
+
 def test_bracket_ratio_stopping_rule() -> None:
     calls = []
 
@@ -881,6 +1004,8 @@ def test_bracket_ratio_stopping_rule() -> None:
     result = adaptive_search(8.0, probe, maximum_rps=10.0, max_refinement_probes=3)
     assert [call[0] for call in calls] == [8.0, 10.0]
     assert result.highest_sustainable_rps == 8.0
+    assert result.termination_reason == "bracket_converged"
+    assert result.bracket_converged
 
 
 def test_adaptive_search_honors_10_probe_cap() -> None:
@@ -888,11 +1013,20 @@ def test_adaptive_search_honors_10_probe_cap() -> None:
     assert len(result.probes) == 10
 
 
+def test_probe_cap_below_max_rate_is_not_reported_as_lower_bound() -> None:
+    result = adaptive_search(0.01, lambda rate, probe_type: outcome(rate), max_open_loop_probes=10)
+    assert result.highest_sustainable_rps < MAX_PROBE_RPS
+    assert not result.capacity_is_lower_bound
+    assert result.search_incomplete
+    assert result.termination_reason == "probe_cap_without_bracket"
+
+
 def test_lower_bound_behavior_at_max_rate() -> None:
     result = adaptive_search(8.0, lambda rate, probe_type: outcome(rate))
     assert result.capacity_is_lower_bound
     assert result.capacity_rps == MAX_PROBE_RPS
     assert result.first_non_sustainable_rps is None
+    assert result.termination_reason == "max_rate_sustainable"
 
 
 def test_failure_when_no_sustainable_point_exists_at_minimum_rate() -> None:
@@ -963,6 +1097,68 @@ def test_dry_run_plan_works_without_server_or_gpu(tmp_path: Path) -> None:
     assert workload["derived_configuration"]["backend"]["model"] == base.backend.model
 
 
+def test_baseline_record_validation_requires_one_success_and_positive_service_latency(tmp_path: Path) -> None:
+    run_dir = make_probe_run_dir(tmp_path, [1.0])
+    record = probe_record(
+        workload_id="W1",
+        probe_type="baseline",
+        run_dir=run_dir,
+        offered_rps=0.01,
+        measured_request_count=1,
+        validation_report={"valid": True, "issues": []},
+    )
+    validate_baseline_record(record)
+    bad = dict(record)
+    bad["success_count"] = 0
+    with pytest.raises(RuntimeError, match="success count"):
+        validate_baseline_record(bad)
+    bad = dict(record)
+    bad["service_latency_mean_s"] = None
+    with pytest.raises(RuntimeError, match="service latency"):
+        validate_baseline_record(bad)
+
+
+def test_negative_cooldown_rejected_before_running(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cooldown_s"):
+        run_calibration(make_vllm_config(tmp_path), ["W1"], output_root=tmp_path, cooldown_s=-1.0)
+
+
+def test_duplicate_workload_ids_are_rejected() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_workload_ids("W1,W1")
+
+
+def test_partial_probe_jsonl_is_preserved_on_calibration_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heteroservebench.calibration as calibration_module
+
+    created = {"count": 0}
+
+    monkeypatch.setattr(calibration_module, "check_scientific_calibration_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(calibration_module, "check_server_health", lambda *args, **kwargs: None)
+    monkeypatch.setattr(calibration_module, "validate_run", lambda *args, **kwargs: {"valid": True, "issues": []})
+
+    def fake_run_experiment(config):
+        created["count"] += 1
+        if created["count"] == 2:
+            raise RuntimeError("simulated calibration failure")
+        run_dir = make_probe_run_dir(tmp_path, [1.0])
+        return run_dir
+
+    monkeypatch.setattr(calibration_module, "run_experiment", fake_run_experiment)
+    config = make_vllm_config(tmp_path)
+    config.backend.exact_output_tokens = True
+    with pytest.raises(RuntimeError, match="simulated calibration failure"):
+        run_calibration(config, ["W1"], output_root=tmp_path / "calibration_runs", cooldown_s=0.0)
+    calibration_dirs = list((tmp_path / "calibration_runs").iterdir())
+    assert len(calibration_dirs) == 1
+    probe_path = calibration_dirs[0] / "calibration_probes.jsonl"
+    manifest = read_json(calibration_dirs[0] / "calibration_manifest.json")
+    assert probe_path.exists()
+    assert len(probe_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert manifest["status"] == "failed"
+    assert manifest["terminal_error"]["type"] == "RuntimeError"
+
+
 def test_calibrate_cli_dry_run_works_without_server_or_gpu(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(
         [
@@ -983,4 +1179,6 @@ def test_calibrate_cli_dry_run_works_without_server_or_gpu(tmp_path: Path, capsy
 
 
 def test_calibration_runs_are_gitignored() -> None:
-    assert "calibration_runs/" in Path(".gitignore").read_text(encoding="utf-8")
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
+    assert "calibration_runs/" in gitignore
+    assert "*.iml" in gitignore

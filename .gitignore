@@ -8,5 +8,6 @@ venv/
 dist/
 build/
 *.egg-info/
+*.iml
 runs/
 calibration_runs/

@@ -60,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "calibrate":
             config = load_config(args.config)
             workload_ids = parse_workload_ids(args.workloads)
+            if args.cooldown_s < 0:
+                raise ValueError(f"cooldown_s must be non-negative: {args.cooldown_s}")
             if args.dry_run:
                 plan = dry_run_plan(config, workload_ids, assumed_l0_s=args.dry_run_l0_s)
                 print(json.dumps(plan, indent=2, sort_keys=True))
